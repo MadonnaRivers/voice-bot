@@ -1,11 +1,6 @@
 ## State: PTP_CONFIRMATION
 
-### Purpose
-Caller confirmed payment intent. Deliver a concise compliance close and end.
+Speak exactly:
+"धन्यवाद। कृपया SMS link या नज़दीकी branch से EMI payment पूरा करें। समय पर भुगतान से penalty और CIBIL पर असर से बचा जा सकता है। आपका दिन शुभ हो।"
 
-### Speak exactly
-"धन्यवाद। कृपया SMS link या नज़दीकी branch से EMI payment पूरा करें।
- समय पर भुगतान से penalty और CIBIL impact से बचा जा सकता है। आपका दिन शुभ हो!"
-
-### Action
-end_call(reason="ptp_secured")
+Then: end_call(reason="ptp_secured")

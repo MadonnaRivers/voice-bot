@@ -1,11 +1,8 @@
 ## State: ALREADY_PAID_MODE_CAPTURE
 
-### Purpose
-Capture payment mode after date is collected.
-
-### Speak exactly
+Speak exactly:
 "कृपया payment mode भी बताइए: UPI, net banking, cash, branch, या कोई और तरीका?"
 
-### After caller response (silent tool only)
-- `goto_already_paid_thanks` for any valid mode/unknown.
-- `mark_unclear` if unclear/noisy.
+After caller response (silent tool only):
+- Any mode / unknown mode -> goto_already_paid_thanks
+- Noise/unclear -> mark_unclear

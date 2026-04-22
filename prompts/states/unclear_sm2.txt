@@ -1,11 +1,6 @@
 ## State: UNCLEAR_SM2
 
-### Purpose
-Second and final retry before unclear close.
+Speak exactly:
+"क्षमा कीजिए, अभी भी स्पष्ट नहीं सुन पाई। कृपया केवल हां या नहीं में बताइए, क्या आप EMI payment आज कर पाएंगे?"
 
-### Speak exactly
-"क्षमा कीजिए, अभी भी स्पष्ट नहीं सुन पाया। कृपया केवल 'हाँ' या 'नहीं' में बताइए,
- क्या आप EMI payment आज कर पाएँगे?"
-
-### Tool behavior
-No tool. Wait for caller response.
+No tool in this state. Wait for caller response.

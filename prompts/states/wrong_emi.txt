@@ -1,11 +1,6 @@
 ## State: WRONG_EMI_DISPUTE
 
-### Purpose
-Handle EMI amount dispute with neutral escalation guidance.
+Speak exactly:
+"राशि संबंधी आपत्ति नोट कर ली गई है। कृपया समाधान के लिए अपने relationship manager या customer care से संपर्क करें। धन्यवाद, आपका दिन शुभ हो।"
 
-### Speak exactly
-"राशि संबंधी आपत्ति नोट कर ली गई है। कृपया समाधान के लिए अपने relationship manager
- या customer care से संपर्क करें। धन्यवाद, आपका दिन शुभ हो!"
-
-### Action
-end_call(reason="dispute")
+Then: end_call(reason="dispute")
