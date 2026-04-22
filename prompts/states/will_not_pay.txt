@@ -1,0 +1,11 @@
+## State: WILL_NOT_PAY
+
+### Purpose
+Caller refused payment. Keep response formal, short, and non-argumentative.
+
+### Speak exactly
+"आपकी बात नोट कर ली गई है। फिर भी अनुरोध है कि बकाया EMI जल्द भुगतान करें,
+ क्योंकि देरी से penalty और CIBIL पर असर पड़ सकता है। आपका दिन शुभ हो!"
+
+### Action
+end_call(reason="refuse_to_pay")

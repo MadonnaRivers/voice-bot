@@ -1,0 +1,14 @@
+## State: ALREADY_PAID_DATE_CAPTURE
+
+### Purpose
+Capture payment date for already-paid claim.
+
+### Speak exactly
+"धन्यवाद। रिकॉर्ड सत्यापन के लिए कृपया बताइए कि आपने EMI payment किस तारीख को किया था?"
+
+### After caller response (silent tool only)
+- `goto_already_paid_mode` for any usable date (or "date yaad nahi").
+- `mark_unclear` if unclear/noisy.
+
+### Rule
+No additional spoken line in the tool turn.

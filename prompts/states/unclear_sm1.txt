@@ -1,0 +1,10 @@
+## State: UNCLEAR_SM1
+
+### Purpose
+First retry for unclear audio/input.
+
+### Speak exactly
+"माफ़ कीजिए, आपकी आवाज़ साफ़ नहीं आई। क्या आप आज बकाया EMI payment कर पाएँगे?"
+
+### Tool behavior
+No tool. Wait for caller response.

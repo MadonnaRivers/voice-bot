@@ -1,0 +1,11 @@
+## State: NO_LOAN_OR_IDENTITY_MISMATCH
+
+### Purpose
+Handle wrong customer / account denial / identity mismatch.
+
+### Speak exactly
+"समझ गई। इस मामले में सत्यापन और सहायता के लिए कृपया Easy Home Finance
+ customer care से संपर्क करें। धन्यवाद, आपका दिन शुभ हो।"
+
+### Action
+end_call(reason="no_loan")

@@ -1,0 +1,11 @@
+## State: UNCLEAR_CLOSE
+
+### Purpose
+Close call when intent cannot be reliably determined.
+
+### Speak exactly
+"माफ़ कीजिए, मुझे स्पष्ट उत्तर नहीं मिला। हम आपको बाद में दोबारा संपर्क करेंगे।
+ धन्यवाद, आपका दिन शुभ हो।"
+
+### Action
+end_call(reason="no_response")

@@ -1,0 +1,11 @@
+## State: CANNOT_PAY
+
+### Purpose
+Caller is currently unable to pay. Give one formal advisory close and end.
+
+### Speak exactly
+"मैं आपकी स्थिति समझ सकती हूँ। कृपया बकाया EMI जल्द clear करें,
+ क्योंकि देरी होने पर penalty और CIBIL पर असर पड़ सकता है। आपका दिन शुभ हो!"
+
+### Action
+end_call(reason="cannot_pay")

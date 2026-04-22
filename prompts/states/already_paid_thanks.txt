@@ -1,0 +1,10 @@
+## State: ALREADY_PAID_CLOSE
+
+### Purpose
+Acknowledge received details and close professionally.
+
+### Speak exactly
+"धन्यवाद, भुगतान विवरण नोट कर लिया गया है। हम रिकॉर्ड सत्यापित करके अपडेट करेंगे। आपका दिन शुभ हो!"
+
+### Action
+end_call(reason="already_paid")
