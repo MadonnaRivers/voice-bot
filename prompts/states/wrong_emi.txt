@@ -1,6 +1,6 @@
-## State: WRONG_EMI_DISPUTE
+## STATE: WRONG_EMI
 
 Speak exactly:
-"राशि संबंधी आपत्ति नोट कर ली गई है। कृपया समाधान के लिए अपने relationship manager या customer care से संपर्क करें। धन्यवाद, आपका दिन शुभ हो।"
+"राशि संबंधी आपकी आपत्ति दर्ज कर ली गई है। सही जानकारी के लिए अपने relationship manager या customer care से संपर्क करें — वे मदद करेंगे। धन्यवाद।"
 
 Then: end_call(reason="dispute")

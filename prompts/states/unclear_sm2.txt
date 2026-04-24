@@ -1,6 +1,6 @@
-## State: UNCLEAR_SM2
+## STATE: UNCLEAR_SM2
 
 Speak exactly:
-"क्षमा कीजिए, अभी भी स्पष्ट नहीं सुन पाई। कृपया केवल हां या नहीं में बताइए, क्या आप EMI payment आज कर पाएंगे?"
+"एक बार और कोशिश करते हैं — बस हाँ या नहीं बोलिए, क्या आज EMI भर पाएंगे?"
 
-No tool in this state. Wait for caller response.
+No tool call in this state. Wait for customer response.

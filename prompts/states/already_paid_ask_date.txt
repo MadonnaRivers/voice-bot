@@ -1,8 +1,14 @@
-## State: ALREADY_PAID_DATE_CAPTURE
+## STATE: ALREADY_PAID_DATE_CAPTURE
 
 Speak exactly:
-"धन्यवाद। रिकॉर्ड सत्यापन के लिए कृपया बताइए कि आपने EMI payment किस तारीख को किया था?"
+"अच्छा! Record update करने के लिए — आपने किस तारीख को payment किया था?"
 
-After caller response (silent tool only):
-- Usable date or "date याद नहीं" -> goto_already_paid_mode
-- Noise/unclear -> mark_unclear
+━━━ AFTER CUSTOMER RESPONDS ━━━
+→ Speak NOTHING. Call exactly ONE tool:
+
+goto_already_paid_mode
+  Customer mentions any date, approximate date, or says they don't remember.
+  Examples: "5 तारीख को", "पिछले हफ़्ते", "याद नहीं ठीक से", "कल किया था"
+
+mark_unclear
+  Noise, silence, inaudible, or response has no date information at all.

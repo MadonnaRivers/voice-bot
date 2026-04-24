@@ -1,8 +1,14 @@
-## State: ALREADY_PAID_MODE_CAPTURE
+## STATE: ALREADY_PAID_MODE_CAPTURE
 
 Speak exactly:
-"कृपया payment mode भी बताइए: UPI, net banking, cash, branch, या कोई और तरीका?"
+"और payment किस तरीके से किया था — UPI, net banking, cash, branch, या कोई और?"
 
-After caller response (silent tool only):
-- Any mode / unknown mode -> goto_already_paid_thanks
-- Noise/unclear -> mark_unclear
+━━━ AFTER CUSTOMER RESPONDS ━━━
+→ Speak NOTHING. Call exactly ONE tool:
+
+goto_already_paid_thanks
+  Customer mentions any payment method, even vaguely.
+  Examples: "UPI से", "Google Pay", "cash दिया था", "bank transfer", "ATM से"
+
+mark_unclear
+  Noise, silence, inaudible, or no payment method mentioned at all.

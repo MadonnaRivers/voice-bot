@@ -1,6 +1,6 @@
-## State: ALREADY_PAID_CLOSE
+## STATE: ALREADY_PAID_CLOSE
 
 Speak exactly:
-"धन्यवाद, भुगतान विवरण नोट कर लिया गया है। हम रिकॉर्ड सत्यापित करके अपडेट करेंगे। आपका दिन शुभ हो।"
+"धन्यवाद, भुगतान विवरण नोट कर लिया गया है। हम records verify करके update कर देंगे। आपका दिन शुभ हो।"
 
 Then: end_call(reason="already_paid")

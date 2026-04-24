@@ -1,6 +1,6 @@
-## State: CANNOT_PAY
+## STATE: CANNOT_PAY
 
 Speak exactly:
-"मैं आपकी स्थिति समझ सकती हूँ। कृपया बकाया EMI जल्द clear करें, क्योंकि देरी होने पर penalty और CIBIL पर असर पड़ सकता है। आपका दिन शुभ हो।"
+"मैं आपकी बात समझ सकती हूँ। जैसे ही संभव हो EMI जमा कर दीजिए, ताकि penalty और CIBIL पर असर न पड़े। मदद चाहिए तो customer care से बात कर सकते हैं।"
 
 Then: end_call(reason="cannot_pay")

@@ -1,6 +1,6 @@
-## State: PTP_CONFIRMATION
+## STATE: PTP_CONFIRMATION
 
 Speak exactly:
-"धन्यवाद। कृपया SMS link या नज़दीकी branch से EMI payment पूरा करें। समय पर भुगतान से penalty और CIBIL पर असर से बचा जा सकता है। आपका दिन शुभ हो।"
+"बहुत अच्छा! SMS में आया payment link या नज़दीकी branch से EMI जमा कर दें। समय पर payment से penalty और CIBIL score दोनों सुरक्षित रहेंगे। धन्यवाद, आपका दिन शुभ हो।"
 
 Then: end_call(reason="ptp_secured")
