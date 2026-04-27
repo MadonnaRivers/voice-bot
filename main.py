@@ -5,20 +5,25 @@ STT : Sarvam Saaras v3   (WebSocket, PCM-16 LE @ 8 kHz)
 LLM : Sarvam-M           (classification fallback only — thinking model)
 TTS : Sarvam Bulbul v3   (HTTP-streaming, µ-law @ 8 kHz → Twilio)
 
-All bot responses are scripted — zero LLM latency on the hot path.
-LLM is called only when the rule-based classifier cannot determine intent.
+Workflow: 7-condition EMI collection flow
+  Root → Opening greeting
+    ├─ C1  Death in family        → empathy close
+    ├─ C2  Partial payment offer  → capture amount + future date
+    ├─ C3  Future payment promise → capture & validate date
+    ├─ C4  Full payment today     → payment instructions
+    ├─ C5  Refusal / unable       → ask reason (×2), credit warning, callback time
+    ├─ C6  Already paid           → capture date + mode, confirm
+    └─ C7  Busy / callback        → capture callback time, confirm
 
-Call flow:
-  Twilio PSTN → Media Stream WebSocket (/media-stream)
-    ├─ recv_twilio()      mulaw → PCM-16 → Sarvam STT WebSocket
-    ├─ recv_sarvam_stt()  VAD + transcripts → utterance queue
-    └─ fsm()              utterances → classify → scripted TTS → Twilio
+All bot lines are scripted — zero LLM latency on the hot path.
+LLM (Sarvam-M) is called only when the rule-based classifier returns None.
 """
 from __future__ import annotations
 
 import asyncio
 import audioop
 import base64
+import concurrent.futures
 import dataclasses
 import json
 import logging
@@ -27,11 +32,15 @@ import re
 import sys
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import date as _date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
+import numpy as np
+import noisereduce as nr
+
 import httpx
+import webrtcvad
 import websockets
 import websockets.exceptions as ws_exc
 from dotenv import load_dotenv
@@ -75,7 +84,7 @@ SARVAM_STT_WS_BASE  = os.getenv("SARVAM_STT_WS_BASE",  "wss://api.sarvam.ai/spee
 SARVAM_STT_MODEL    = os.getenv("SARVAM_STT_MODEL",    "saaras:v3")
 SARVAM_STT_LANGUAGE = os.getenv("SARVAM_STT_LANGUAGE", "hi-IN")
 SARVAM_LLM_BASE_URL = os.getenv("SARVAM_LLM_BASE_URL", "https://api.sarvam.ai/v1")
-LLM_MODEL           = os.getenv("SARVAM_LLM_MODEL",    "sarvam-m")
+LLM_MODEL           = os.getenv("SARVAM_LLM_MODEL",    "sarvam-105b")
 SARVAM_VOICE        = os.getenv("SARVAM_VOICE",        "simran")
 PORT                = int(os.getenv("PORT",             "5050"))
 TRANSCRIPTS_DIR     = os.getenv("TRANSCRIPTS_DIR",     "transcripts")
@@ -84,6 +93,22 @@ MAKE_CALL_API_KEY   = os.getenv("MAKE_CALL_API_KEY",   "")
 HANGUP_GRACE_SEC    = float(os.getenv("HANGUP_GRACE_SEC",    "1.5"))
 SILENCE_TIMEOUT_SEC = float(os.getenv("SILENCE_TIMEOUT_SEC", "20.0"))
 TTS_PACE            = float(os.getenv("TTS_PACE",            "1.1"))
+
+# Noise gate — WebRTC VAD silences non-speech frames before they reach STT
+# VAD_MODE: 0 = least aggressive, 3 = most aggressive noise suppression
+VAD_MODE           = int(os.getenv("VAD_MODE",           "2"))
+VAD_HANGOVER_MS    = int(os.getenv("VAD_HANGOVER_MS",    "300"))  # keep audio N ms after speech ends
+VAD_ENABLED        = os.getenv("VAD_ENABLED", "true").lower() not in ("0", "false", "no")
+
+# Spectral noise cancellation — noisereduce (runs in thread pool, ~17 ms / 80 ms chunk)
+DENOISE_ENABLED    = os.getenv("DENOISE_ENABLED",    "true").lower() not in ("0", "false", "no")
+DENOISE_STRENGTH   = float(os.getenv("DENOISE_STRENGTH",   "0.80"))  # 0.0–1.0
+DENOISE_PROFILE_SEC = float(os.getenv("DENOISE_PROFILE_SEC", "1.5")) # seconds of silence at call start used as noise reference
+
+# How long (seconds) the FSM waits after the first transcript arrives before responding.
+# Drains any follow-up STT fragments that arrive during this window so the bot
+# acts on the complete utterance instead of the first short chunk.
+POST_UTTERANCE_PAUSE_SEC = float(os.getenv("POST_UTTERANCE_PAUSE_SEC", "1.8"))
 
 SARVAM_STT_WS_URL = (
     f"{SARVAM_STT_WS_BASE}"
@@ -101,6 +126,71 @@ SARVAM_TTS_REST_URL   = "https://api.sarvam.ai/text-to-speech"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Spectral noise cancellation
+# ─────────────────────────────────────────────────────────────────────────────
+class _StreamDenoiser:
+    """
+    Per-call spectral noise canceller.
+
+    Pipeline:
+      Phase 1 (first DENOISE_PROFILE_SEC seconds): collect audio as a noise
+        reference — assumes the line is live but the customer hasn't spoken yet.
+      Phase 2: process incoming PCM-16 LE in 80 ms chunks via noisereduce
+        stationary subtraction; output with ~80 ms delay.
+
+    feed_sync() is CPU-bound; call it via loop.run_in_executor to keep the
+    asyncio event loop free.
+    """
+    CHUNK_SAMP = 640    # 80 ms at 8 kHz — good FFT resolution, fits in ~17 ms CPU
+
+    def __init__(self, sr: int = 8000, prop_decrease: float = 0.80,
+                 profile_sec: float = 1.5) -> None:
+        self._sr     = sr
+        self._prop   = prop_decrease
+        self._target = int(sr * profile_sec)
+        self._pbuf:   list[np.ndarray] = []
+        self._noise:  np.ndarray | None = None
+        self._inbuf  = np.zeros(0, dtype=np.float32)
+        self._outbuf = np.zeros(0, dtype=np.float32)
+
+    def feed_sync(self, pcm16: bytes) -> bytes:
+        chunk = np.frombuffer(pcm16, dtype=np.int16).astype(np.float32) / 32768.0
+
+        # ── Phase 1: noise profiling ──────────────────────────────────────────
+        if self._noise is None:
+            self._pbuf.append(chunk)
+            if sum(a.shape[0] for a in self._pbuf) >= self._target:
+                self._noise = np.concatenate(self._pbuf)
+                self._pbuf.clear()
+            return pcm16   # pass through while building profile
+
+        # ── Phase 2: buffer → denoise → output ───────────────────────────────
+        self._inbuf = np.concatenate([self._inbuf, chunk])
+
+        if self._inbuf.shape[0] >= self.CHUNK_SAMP:
+            seg         = self._inbuf[:self.CHUNK_SAMP]
+            self._inbuf = self._inbuf[self.CHUNK_SAMP:]
+            try:
+                clean = nr.reduce_noise(
+                    y=seg, y_noise=self._noise, sr=self._sr,
+                    stationary=True, prop_decrease=self._prop,
+                    n_fft=256, n_jobs=1,
+                )
+                self._outbuf = np.concatenate([self._outbuf, clean])
+            except Exception:
+                self._outbuf = np.concatenate([self._outbuf, seg])
+
+        # Return one frame's worth of processed audio (~80 ms output delay)
+        n = chunk.shape[0]
+        if self._outbuf.shape[0] >= n:
+            out          = self._outbuf[:n]
+            self._outbuf = self._outbuf[n:]
+            return (np.clip(out, -1.0, 1.0) * 32768).astype(np.int16).tobytes()
+
+        return pcm16   # output buffer not yet primed — pass original through
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Shared clients
 # ─────────────────────────────────────────────────────────────────────────────
 _http = httpx.AsyncClient(
@@ -111,78 +201,156 @@ _oai = AsyncOpenAI(api_key=SARVAM_API_KEY, base_url=SARVAM_LLM_BASE_URL)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Default customer data — overridden per-call via POST /make-call body
+# Default customer data — override per-call via POST /make-call body
 # ─────────────────────────────────────────────────────────────────────────────
 DEFAULT_CUSTOMER: dict[str, str] = {
-    "customer_name":    os.getenv("DEFAULT_CUSTOMER_NAME",    "Mr. Sharma"),
+    "customer_name":    os.getenv("DEFAULT_CUSTOMER_NAME",    "Rahul"),
     "lender":           os.getenv("DEFAULT_LENDER",           "Easy Home Finance"),
     "loan_type":        os.getenv("DEFAULT_LOAN_TYPE",        "Home Loan"),
-    "account_last4":    os.getenv("DEFAULT_ACCOUNT_LAST4",    "4321"),
-    "emi_due_date":     os.getenv("DEFAULT_EMI_DUE_DATE",     "5"),
-    "emi_amount":       os.getenv("DEFAULT_EMI_AMOUNT",       "15500"),
-    "emi_amount_words": os.getenv("DEFAULT_EMI_AMOUNT_WORDS", "पंद्रह हज़ार पाँच सौ"),
+    "loan_id":          os.getenv("DEFAULT_LOAN_ID",          "EH12345"),
+    "emi_amount":       os.getenv("DEFAULT_EMI_AMOUNT",       "8,500"),
+    "emi_amount_int":   os.getenv("DEFAULT_EMI_AMOUNT_INT",   "8500"),
+    "emi_due_date":     os.getenv("DEFAULT_EMI_DUE_DATE",     "5 March 2026"),
+    "min_partial":      os.getenv("DEFAULT_MIN_PARTIAL",      "1,500"),
+    "min_partial_int":  os.getenv("DEFAULT_MIN_PARTIAL_INT",  "1500"),
+    "payment_deadline": os.getenv("DEFAULT_PAYMENT_DEADLINE", "2026-03-20"),
 }
 
+# Mandatory closing — used at end of C2 C3 C4 C5
+_MANDATORY_CLOSING = (
+    "भुगतान पूरा करने के लिए आपको भेजे गए सुरक्षित लिंक का उपयोग करें। "
+    "कृपया {payment_deadline} तक शेष राशि चुकाने की कोशिश करें "
+    "ताकि आपका क्रेडिट स्कोर सुरक्षित रहे। "
+    "आपके सहयोग के लिए धन्यवाद, और आपका दिन शुभ हो।"
+)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FSM — scripted responses, state tables, transitions
+# Scripted responses (Hinglish)
 # ─────────────────────────────────────────────────────────────────────────────
-
-# All bot lines. Use {key} placeholders — filled from per-call customer context.
 _SCRIPTS: dict[str, str] = {
+    # ── Opening ──────────────────────────────────────────────────────────────
     "opening": (
-        "नमस्ते, मैं {lender} से अदिति बोल रही हूँ। "
-        "क्या मैं {customer_name} से बात कर रही हूँ? "
-        "आपकी {loan_type} की {emi_amount_words} रुपये की EMI "
-        "इस महीने {emi_due_date} तारीख से बकाया है। "
-        "क्या आप आज payment कर पाएंगे?"
+        "नमस्ते {customer_name} जी, मैं Aditi बोल रही हूँ Easy Home Finance से। "
+        "आपकी {emi_amount} रुपये की EMI, जो {emi_due_date} को देय थी, अभी तक बाकी है। "
+        "कृपया बताइए आप कब तक भुगतान कर पाएंगे?"
     ),
-    "ptp": (
-        "बहुत अच्छा! SMS में आया payment link या नज़दीकी branch से EMI जमा कर दें। "
-        "समय पर payment से penalty और CIBIL score दोनों सुरक्षित रहेंगे। "
-        "धन्यवाद, आपका दिन शुभ हो।"
-    ),
-    "cannot_pay": (
-        "मैं आपकी बात समझ सकती हूँ। "
-        "जैसे ही संभव हो EMI जमा कर दीजिए, ताकि penalty और CIBIL पर असर न पड़े। "
-        "मदद चाहिए तो customer care से बात कर सकते हैं। धन्यवाद।"
-    ),
-    "will_not_pay": (
-        "ठीक है, आपकी बात नोट कर ली गई है। "
-        "कृपया ध्यान रखें, बकाया EMI रहने पर penalty और CIBIL score पर असर पड़ सकता है। "
+
+    # ── C1: Death ────────────────────────────────────────────────────────────
+    "death_response": (
+        "मुझे आपके नुकसान के लिए बहुत दुख है। "
+        "इस कठिन समय में हम आपके साथ हैं। "
+        "हमारी टीम का एक सदस्य जल्द ही आपसे व्यक्तिगत रूप से संपर्क करेगा। "
         "धन्यवाद।"
     ),
-    "no_loan": (
-        "ठीक है, हम रिकॉर्ड जाँचेंगे। "
-        "किसी भी सहायता के लिए {lender} customer care से संपर्क कर सकते हैं। "
-        "धन्यवाद, आपका दिन शुभ हो।"
+
+    # ── C2: Partial payment ──────────────────────────────────────────────────
+    "offer_partial": (
+        "मैं समझती हूँ कि आप अभी आर्थिक कठिनाई में हैं। "
+        "क्या आप आज आंशिक भुगतान कर सकते हैं? "
+        "न्यूनतम {min_partial} रुपये होना चाहिए।"
     ),
-    "wrong_emi": (
-        "राशि संबंधी आपकी आपत्ति दर्ज कर ली गई है। "
-        "सही जानकारी के लिए अपने relationship manager या customer care से संपर्क करें। "
-        "धन्यवाद।"
+    "partial_ask_amount": (
+        "धन्यवाद। आप आज कितनी राशि का भुगतान कर सकते हैं? "
+        "न्यूनतम {min_partial} रुपये होना चाहिए।"
     ),
-    "faq_who_are_you": (
-        "मैं अदिति बोल रही हूँ, {lender} की तरफ़ से। "
-        "यह call आपकी बकाया {loan_type} EMI के बारे में है। "
-        "बताइए, क्या आप आज payment कर पाएंगे?"
+    "partial_amount_too_low": (
+        "यह राशि न्यूनतम से कम है। "
+        "कृपया {min_partial} रुपये या उससे अधिक बताइए।"
     ),
+    "partial_amount_unclear": (
+        "मुझे राशि समझ नहीं आई। "
+        "कृपया रुपये में बताइए, जैसे दो हजार या तीन हजार।"
+    ),
+    "partial_ask_remaining_date": (
+        "धन्यवाद। आज {partial_amount} रुपये के भुगतान के बाद "
+        "{remaining_balance} रुपये शेष रहेंगे। "
+        "आप यह बाकी राशि कब तक चुकाएंगे?"
+    ),
+    "partial_date_retry": (
+        "यह तारीख मान्य नहीं लगी। "
+        "कृपया एक भविष्य की तारीख बताइए जो नब्बे दिनों के अंदर हो।"
+    ),
+    "partial_confirm": (
+        "ठीक है, हमने आपकी भुगतान जानकारी नोट कर ली है। "
+        + _MANDATORY_CLOSING
+    ),
+
+    # ── C3: Future promise ────────────────────────────────────────────────────
+    "future_ask_date": (
+        "धन्यवाद। आप भुगतान किस तारीख तक कर पाएंगे?"
+    ),
+    "future_date_retry": (
+        "यह तारीख मान्य नहीं लगी। "
+        "कृपया एक भविष्य की तारीख बताइए जो नब्बे दिनों के अंदर हो।"
+    ),
+    "future_confirm": (
+        "ठीक है, हमने आपकी भुगतान तारीख {payment_date} नोट कर ली है। "
+        + _MANDATORY_CLOSING
+    ),
+
+    # ── C4: Full payment today ────────────────────────────────────────────────
+    "full_payment_today": (
+        "धन्यवाद। कृपया SMS के माध्यम से भेजे गए सुरक्षित लिंक का उपयोग करके "
+        "या अपनी नजदीकी शाखा में जाकर भुगतान पूरा करें। "
+        + _MANDATORY_CLOSING
+    ),
+
+    # ── C5: Refusal / unable to pay ───────────────────────────────────────────
+    "refusal_ask_reason": (
+        "समझ गई। क्या आप बता सकते हैं कि आप भुगतान क्यों नहीं कर पा रहे हैं?"
+    ),
+    "refusal_escalate": (
+        "मैं समझती हूँ। "
+        "क्या कोई विशेष कारण है जिसकी वजह से आप अभी भुगतान नहीं कर पा रहे?"
+    ),
+    "refusal_credit_warn": (
+        "ठीक है, हमने आपकी बात नोट कर ली है। "
+        "कृपया ध्यान रखें कि बकाया EMI से जुर्माना और CIBIL स्कोर पर असर पड़ सकता है। "
+        "आप चाहेंगे कि हम आपसे दोबारा कब संपर्क करें?"
+    ),
+    "refusal_close": (
+        "ठीक है, हम आपसे {callback_time} पर संपर्क करेंगे। "
+        + _MANDATORY_CLOSING
+    ),
+
+    # ── C6: Already paid ──────────────────────────────────────────────────────
     "already_paid_ask_date": (
-        "अच्छा! Record update करने के लिए — "
-        "आपने किस तारीख को payment किया था?"
+        "कृपया बताइए कि आपने भुगतान किस तारीख को किया था?"
+    ),
+    "already_paid_date_invalid": (
+        "यह भविष्य की तारीख है। "
+        "कृपया वह सही तारीख बताइए जब आपने वास्तव में भुगतान किया था।"
+    ),
+    "already_paid_date_unclear": (
+        "तारीख समझ नहीं आई। कृपया फिर से बताइए।"
     ),
     "already_paid_ask_mode": (
-        "और payment किस तरीके से किया था — "
-        "UPI, net banking, cash, branch, या कोई और?"
+        "भुगतान किस माध्यम से किया गया था? "
+        "जैसे UPI, Google Pay, नेट बैंकिंग, नकद, शाखा, या कोई अन्य?"
     ),
-    "already_paid_thanks": (
-        "धन्यवाद, भुगतान विवरण नोट कर लिया गया है। "
-        "हम records verify करके update कर देंगे। "
+    "already_paid_confirm": (
+        "धन्यवाद। हमने आपकी जानकारी प्राप्त कर ली है। "
+        "हम इसे सत्यापित करके अपने रिकॉर्ड अपडेट कर देंगे। "
         "आपका दिन शुभ हो।"
     ),
+
+    # ── C7: Busy / callback ───────────────────────────────────────────────────
+    "callback_ask_time": (
+        "कोई बात नहीं। आप बताइए कि मैं आपको कब कॉल करूँ?"
+    ),
+    "callback_time_unclear": (
+        "समय समझ नहीं आया। कृपया फिर से बताइए, जैसे 'कल दोपहर' या 'तीन बजे'।"
+    ),
+    "callback_confirm": (
+        "ठीक है, हम आपसे {callback_time} पर संपर्क करेंगे। "
+        "कृपया कोशिश करें कि EMI जल्दी चुका दें ताकि जुर्माना न लगे।"
+    ),
+
+    # ── Unclear handler ───────────────────────────────────────────────────────
     "unclear_sm1": (
-        "माफ़ कीजिए, आवाज़ साफ़ नहीं आई। "
-        "क्या आप आज EMI payment कर पाएंगे — हाँ या नहीं?"
+        "माफी चाहती हूँ, आवाज़ साफ नहीं आई। "
+        "क्या आप आज EMI भुगतान कर पाएंगे — हाँ या नहीं?"
     ),
     "unclear_sm2": (
         "एक बार और कोशिश करते हैं — "
@@ -195,34 +363,169 @@ _SCRIPTS: dict[str, str] = {
     ),
 }
 
-# States that hang up after speaking
+# Terminal states — speak and hang up
 _TERMINAL: set[str] = {
-    "ptp", "cannot_pay", "will_not_pay", "no_loan",
-    "wrong_emi", "already_paid_thanks", "unclear_close",
+    "death_response", "partial_confirm", "future_confirm",
+    "full_payment_today", "refusal_close", "already_paid_confirm",
+    "callback_confirm", "unclear_close",
 }
 
-# States that need user input classified before advancing
-_CLASSIFY_STATES: set[str] = {"opening", "already_paid_ask_date", "already_paid_ask_mode"}
-
-# classification result → next FSM state
-_TRANSITIONS: dict[str, str] = {
-    "goto_ptp":               "ptp",
-    "goto_cannot_pay":        "cannot_pay",
-    "goto_will_not_pay":      "will_not_pay",
-    "goto_already_paid":      "already_paid_ask_date",
-    "goto_no_loan":           "no_loan",
-    "goto_wrong_emi":         "wrong_emi",
-    "answer_faq_who_are_you": "faq_who_are_you",
-    "goto_already_paid_mode": "already_paid_ask_mode",
-    "goto_already_paid_thanks": "already_paid_thanks",
-}
-
-# Non-classify states that loop back to a parent state after speaking
+# States that advance to "opening" after speaking (no user input needed)
 _AUTO_ADVANCE: dict[str, str] = {
-    "faq_who_are_you": "opening",
-    "unclear_sm1":     "opening",
-    "unclear_sm2":     "opening",
+    "unclear_sm1": "opening",
+    "unclear_sm2": "opening",
 }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Date & amount utilities
+# ─────────────────────────────────────────────────────────────────────────────
+_MONTH_MAP: dict[str, int] = {
+    "jan": 1, "january": 1, "janvari": 1,
+    "feb": 2, "february": 2, "farvari": 2,
+    "mar": 3, "march": 3,
+    "apr": 4, "april": 4,
+    "may": 5, "mai": 5,
+    "jun": 6, "june": 6,
+    "jul": 7, "july": 7,
+    "aug": 8, "august": 8,
+    "sep": 9, "sept": 9, "september": 9, "sitambar": 9,
+    "oct": 10, "october": 10, "aktubar": 10,
+    "nov": 11, "november": 11, "navambar": 11,
+    "dec": 12, "december": 12, "disambar": 12,
+}
+
+
+def _parse_date(text: str) -> _date | None:
+    """Extract a date from a Hindi/Hinglish utterance. Returns None if unparseable."""
+    t = text.lower().strip()
+    today = _date.today()
+
+    # Devanagari → Roman so the regexes below match both scripts
+    t = (t.replace("आज", "aaj")
+          .replace("कल", "kal")
+          .replace("परसों", "parso").replace("परसो", "parso")
+          .replace("अगले हफ़्ते", "agle hafte")
+          .replace("अगले हफ्ते", "agle hafte")
+          .replace("इस हफ्ते", "is hafte").replace("इस हफ़्ते", "is hafte")
+          .replace("अगले महीने", "agle mahine")
+          .replace("महीने में", "mahine mein").replace("महीने बाद", "mahine baad")
+          .replace("हफ़्ते में", "hafte mein").replace("हफ्ते में", "hafte mein")
+          .replace("दिनों में", "dinon mein").replace("दिन में", "din mein"))
+
+    if re.search(r"\baaj\b|today", t):
+        return today
+    if re.search(r"\bkal\b|tomorrow", t):
+        return today + timedelta(days=1)
+    if re.search(r"\bparso\b|parson\b", t):
+        return today + timedelta(days=2)
+    if re.search(r"agle\s+hafte|next\s+week", t):
+        return today + timedelta(days=7)
+    if re.search(r"agle\s+mahine|next\s+month|mahine\s+(?:mein|baad)", t):
+        return today + timedelta(days=30)
+
+    # "2-3 din" → take first
+    m = re.search(r"(\d+)\s*[-–]\s*\d+\s*din", t)
+    if m:
+        return today + timedelta(days=int(m.group(1)))
+
+    # "X din" / "X days"
+    m = re.search(r"(\d+)\s*(?:din\b|days?\b)", t)
+    if m:
+        return today + timedelta(days=int(m.group(1)))
+
+    # "15 March" / "March 15" (with optional year)
+    for name, num in _MONTH_MAP.items():
+        m = re.search(rf"(\d{{1,2}})\s+{name}(?:\s+(\d{{4}}))?", t)
+        if m:
+            day, year = int(m.group(1)), int(m.group(2)) if m.group(2) else today.year
+            try:
+                d = _date(year, num, day)
+                if d < today and not m.group(2):
+                    d = _date(year + 1, num, day)
+                return d
+            except ValueError:
+                return None
+        m = re.search(rf"{name}\s+(\d{{1,2}})(?:\s+(\d{{4}}))?", t)
+        if m:
+            day, year = int(m.group(1)), int(m.group(2)) if m.group(2) else today.year
+            try:
+                d = _date(year, num, day)
+                if d < today and not m.group(2):
+                    d = _date(year + 1, num, day)
+                return d
+            except ValueError:
+                return None
+
+    # Bare number 1–31 → treat as day of current/next month
+    m = re.search(r"\b(\d{1,2})\b", t)
+    if m:
+        day = int(m.group(1))
+        if 1 <= day <= 31:
+            try:
+                d = _date(today.year, today.month, day)
+                if d <= today:
+                    nm = today.month % 12 + 1
+                    ny = today.year + (1 if today.month == 12 else 0)
+                    d  = _date(ny, nm, day)
+                return d
+            except ValueError:
+                pass
+
+    return None
+
+
+def _parse_amount(text: str) -> int | None:
+    """Extract a rupee amount (integer) from Hindi/Hinglish speech."""
+    t = (text.lower()
+         .replace(",", "")
+         .replace("₹", " ")
+         .replace("rs.", " ")
+         .replace("rs ", " ")
+         .replace("रुपये", " ").replace("रुपए", " ").replace("रूपये", " ")
+         .replace("rupaye", " ").replace("rupees", " ").replace("rupiya", " ")
+         # Devanagari → Roman so the regexes below match both scripts
+         .replace("हज़ार", "hazaar").replace("हजार", "hazaar")
+         .replace("सौ", "sau").replace("सो", "sau")
+         .replace("लाख", "lakh"))
+
+    # "X hazaar Y sau" → X*1000 + Y*100
+    m = re.search(r"(\d+)\s*(?:hazaar|hazar|hajar|thousand)\s*(?:(\d+)\s*(?:sau|so|hundred))?", t)
+    if m:
+        return int(m.group(1)) * 1000 + (int(m.group(2)) * 100 if m.group(2) else 0)
+
+    # "X lakh" → X*100000
+    m = re.search(r"(\d+)\s*lakh", t)
+    if m:
+        return int(m.group(1)) * 100_000
+
+    # "X sau" → X*100
+    m = re.search(r"(\d+)\s*(?:sau|so|hundred)", t)
+    if m:
+        return int(m.group(1)) * 100
+
+    # Any 3–6 digit number
+    m = re.search(r"\b(\d{3,6})\b", t)
+    if m:
+        return int(m.group(1))
+
+    return None
+
+
+def _fmt_date(d: _date) -> str:
+    return d.strftime("%-d %B %Y")
+
+
+_TRAILING_VERBS = re.compile(
+    r"\s*(?:करना|करूंगा|करूँगा|कर दूंगा|कर दूँगा|कर दें|कर दीजिए"
+    r"|हो जाएगा|हो जायेगा|बाद में|ठीक है|okay|ok)[।.,\s]*$",
+    re.IGNORECASE,
+)
+
+def _clean_callback_time(text: str) -> str:
+    """Strip trailing filler verbs from a callback-time utterance."""
+    cleaned = _TRAILING_VERBS.sub("", text.strip()).strip("।., ")
+    return cleaned if cleaned else text[:60]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -231,189 +534,186 @@ _AUTO_ADVANCE: dict[str, str] = {
 
 def _heuristic(utterance: str, state: str) -> str | None:
     """
-    Rule-based classifier. Returns a transition name, 'mark_unclear', or None.
-    None means the utterance is genuinely ambiguous — caller should use LLM.
+    Keyword classifier. Returns a transition label or None (→ LLM fallback).
+    Only called for states that require intent classification.
     """
     t = utterance.lower().strip()
     if not t or t == "[silence]":
         return "mark_unclear"
 
+    # ── OPENING ──────────────────────────────────────────────────────────────
     if state == "opening":
-        # ── FAQ / identity ───────────────────────────────────────────────────
-        if any(k in t for k in ["कौन", "किसका", "कहाँ से", "किसलिए", "why call",
-                                  "who are", "easy home", "किस company"]):
-            return "answer_faq_who_are_you"
+        # C1: death
+        if any(k in t for k in ["maut", "mara", "mar gaye", "expire", "wafat",
+                                  "nahi rahe", "guzar gaye", "chale gaye", "निधन",
+                                  "मौत", "गुज़र गए", "नहीं रहे"]):
+            return "goto_death"
 
-        # ── Already paid ─────────────────────────────────────────────────────
-        if any(k in t for k in ["कर दिया", "दे दिया", "भेज दिया", "भेज दिए",
-                                  "payment हो गई", "payment हो गया", "पेमेंट हो गई",
-                                  "पेमेंट हो गया", "payment कर दिया", "पेमेंट कर दिया",
-                                  "already paid", "already", "पहले ही", "हो चुका",
-                                  "कर चुका", "कर चुकी", "भर दिया", "भर चुका"]):
+        # C6: already paid
+        if any(k in t for k in ["kar diya", "de diya", "bhej diya", "ho gaya", "paid",
+                                  "already", "pehle hi", "kar chuka", "kiya tha",
+                                  "कर दिया", "दे दिया", "भेज दिया", "हो गया", "पहले ही"]):
             return "goto_already_paid"
 
-        # ── Wrong number / wrong person ──────────────────────────────────────
-        if any(k in t for k in ["गलत नंबर", "wrong number", "मेरा loan नहीं",
-                                  "loan नहीं है", "कोई loan नहीं", "मैं शर्मा नहीं",
-                                  "wrong person", "not me", "गलत है नंबर",
-                                  "मेरे नाम पर नहीं", "मेरी नहीं है"]):
-            return "goto_no_loan"
+        # C7: busy / callback
+        if any(k in t for k in ["busy", "vyast", "baad mein", "later", "call back",
+                                  "callback", "abhi time nahi", "phir karo",
+                                  "बाद में", "अभी time नहीं", "व्यस्त"]):
+            return "goto_callback"
 
-        # ── Amount dispute ───────────────────────────────────────────────────
-        if any(k in t for k in ["amount गलत", "emi गलत", "राशि गलत", "गलत राशि",
-                                  "इतनी emi नहीं", "emi इतनी नहीं", "इतना नहीं बनता",
-                                  "गलत amount", "amount wrong"]):
-            return "goto_wrong_emi"
+        # C2: explicit partial payment offer
+        if any(k in t for k in ["partial", "thoda", "kuch amount", "aadha", "half",
+                                  "kuch de sakta", "thodi payment",
+                                  "थोड़ा", "कुछ", "आधा"]):
+            return "goto_partial"
 
-        # ── Hard refusal — explicitly will not pay ───────────────────────────
-        if any(k in t for k in ["नहीं भरूंगा", "नहीं भरूँगा", "नहीं दूंगा", "नहीं दूँगा",
-                                  "मत कॉल", "मत फोन", "मत call", "मत phone",
-                                  "पेमेंट नहीं करनी", "payment नहीं करनी",
-                                  "payment नहीं करूंगा", "नहीं करूंगा payment",
-                                  "नहीं भरेंगे", "नहीं करेंगे",
-                                  "कोई मतलब नहीं", "मुझे मतलब नहीं",
-                                  "नहीं करना", "नहीं करनी"]):
-            return "goto_will_not_pay"
+        # C3: future date promise
+        if any(k in t for k in ["tarikh", "date tak", "din mein", "hafte mein",
+                                  "next week", "kal tak", "parso tak", "is hafte",
+                                  "agle hafte", "agle mahine", "mahine mein",
+                                  "तारीख", "दिन में", "हफ़्ते में", "कल तक",
+                                  "अगले हफ़्ते", "अगले हफ्ते", "अगले महीने",
+                                  "महीने में", "महीने बाद", "महीने तक",
+                                  "हफ्ते में", "हफ्ते बाद", "हफ्ते तक"]):
+            return "goto_future_promise"
 
-        # ── Cannot / unable to pay — needs time or money ─────────────────────
-        if any(k in t for k in ["नहीं कर पाऊंगा", "नहीं कर पाऊँगा", "नहीं हो पाएगा",
-                                  "नहीं हो पाएगी", "कर पाऊंगा नहीं", "नहीं कर पाता",
-                                  "नहीं कर पाती", "अभी नहीं", "अभी नहि",
-                                  "नहीं मेरे", "मेरे को नहीं", "बाद में",
-                                  "बाद में करूंगा", "थोड़ा समय", "कुछ दिन",
-                                  "पैसे नहीं", "पैसे नहि", "पैसों की",
-                                  "मुश्किल है", "तकलीफ", "problem है",
-                                  "extend", "समय दे", "time दे",
-                                  "10 दिन", "15 दिन", "महीने बाद",
-                                  "next month", "अगले हफ़्ते", "अगले हफ्ते"]):
-            return "goto_cannot_pay"
+        # C4: full payment right now / today
+        if any(k in t for k in ["aaj karunga", "aaj kar deta", "abhi karta",
+                                  "turant", "abhi pay", "immediately",
+                                  "आज करूंगा", "आज कर देता", "अभी करता"]):
+            return "goto_pay_now"
 
-        # ── Positive commitment ──────────────────────────────────────────────
-        if any(k in t for k in ["हाँ", "हां", "जी हाँ", "जी हां", "ठीक है",
-                                  "theek hai", "कर दूंगा", "करूंगा", "करूँगा",
-                                  "भर दूंगा", "भर दूँगा", "हो जाएगा",
-                                  "कर देता", "कर देती", "pay कर", "okay", " ok ",
-                                  "sure", "bilkul", "बिल्कुल"]):
-            return "goto_ptp"
+        # C5a: financial difficulty (unable) → offer partial first
+        if any(k in t for k in ["nahi kar paunga", "nahi ho payega", "mushkil",
+                                  "problem hai", "paise nahi", "takleef", "dikkat",
+                                  "nahi kar pata", "नहीं कर पाऊंगा", "मुश्किल",
+                                  "पैसे नहीं", "तकलीफ़"]):
+            return "goto_financial_difficulty"
 
-        # ── Bare नहीं with no other context → cannot pay (benefit of doubt) ─
-        if "नहीं" in t or "नहि" in t or "nahi" in t:
-            return "goto_cannot_pay"
+        # C5b: hard refusal (won't pay)
+        if any(k in t for k in ["nahi karunga", "nahi dunga", "band karo", "mat karo",
+                                  "mujhe matlab nahi", "nahi bhejna",
+                                  "नहीं करूंगा", "नहीं दूंगा", "बंद करो"]):
+            return "goto_refusal"
 
-        return None  # genuinely ambiguous → LLM fallback
+        # Generic yes → full payment
+        if any(k in t for k in ["haan", "han", "ha ", "bilkul", "zaroor",
+                                  "theek hai", "okay", "ok", "karunga", "kar dunga",
+                                  "हाँ", "हां", "बिल्कुल", "ठीक है", "करूंगा"]):
+            return "goto_pay_now"
 
-    elif state == "already_paid_ask_date":
-        # Anything substantive counts — we just want to capture the date
-        if any(k in t for k in ["याद नहीं", "याद नहि", "remember नहीं", "don't remember",
-                                  "पता नहीं", "exact याद नहीं"]):
-            return "goto_already_paid_mode"  # "don't remember" is still an answer
-        if re.search(r"\d", t):
-            return "goto_already_paid_mode"  # any number = likely a date
-        if any(k in t for k in ["कल", "परसों", "हफ़्ते", "हफ्ते", "week",
-                                  "महीने", "तारीख", "तारिख", "date", "को"]):
-            return "goto_already_paid_mode"
+        # Bare नहीं / nahi → financial difficulty (benefit of doubt)
+        if "nahi" in t or "नहीं" in t:
+            return "goto_financial_difficulty"
+
+        return None  # ambiguous → LLM
+
+    # ── OFFER PARTIAL (after financial difficulty) ────────────────────────────
+    elif state == "offer_partial":
+        if any(k in t for k in ["haan", "han", "bilkul", "theek hai", "okay", "karunga",
+                                  "partial", "de sakta", "kar sakta", "हाँ", "ठीक है"]):
+            return "goto_partial_yes"
+        return "goto_partial_no"   # any other response = decline
+
+    # ── REFUSAL: ask reason / escalate ───────────────────────────────────────
+    elif state in ("refusal_ask_reason", "refusal_escalate"):
+        # Clear continued refusal (won't give a reason)
+        if any(k in t for k in ["nahi bataunga", "chodo", "band karo", "mat karo",
+                                  "koi reason nahi", "nahi bolunga", "nahi chahiye",
+                                  "नहीं बताऊंगा", "छोड़ो", "बंद करो"]):
+            return "still_refusing"
+        # Any other substantive reply = reason given
         words = [w for w in t.split() if w.strip(".,?!।")]
-        if len(words) >= 1:
-            return "goto_already_paid_mode"
-        return "mark_unclear"
-
-    elif state == "already_paid_ask_mode":
-        # Any payment method mention or substantive response → proceed
-        if any(k in t for k in ["upi", "google pay", "gpay", "phonepe", "paytm",
-                                  "bhim", "cash", "नकद", "bank", "net banking",
-                                  "neft", "imps", "rtgs", "branch", "atm",
-                                  "cheque", "card", "transfer", "online",
-                                  "mobile", "wallet"]):
-            return "goto_already_paid_thanks"
-        words = [w for w in t.split() if w.strip(".,?!।")]
-        if len(words) >= 1:
-            return "goto_already_paid_thanks"
-        return "mark_unclear"
+        if len(words) >= 2:
+            return "got_reason"
+        return "still_refusing"
 
     return None
 
 
-# Sarvam-M is a thinking model: it emits <think>...</think> before the answer.
-# The LLM is ONLY called when the heuristic cannot determine intent.
 _LLM_CLASSIFY_PROMPTS: dict[str, str] = {
     "opening": """\
-You are classifying a customer's response in a Hindi EMI collection call.
+You are classifying a Hindi/Hinglish customer response in an EMI collection call.
 
-The agent asked: "क्या आप आज payment कर पाएंगे?" (Can you make the payment today?)
+The agent asked: "Aapka EMI pending hai, kab tak kar paayenge?"
 The customer said: "{utterance}"
 
-Choose EXACTLY ONE label — output only the label, nothing else:
+Choose EXACTLY ONE label (output only the label):
+GOTO_PAY_NOW              — agrees to pay today or immediately
+GOTO_PARTIAL              — offers partial payment explicitly
+GOTO_FUTURE_PROMISE       — agrees to pay on a specific future date
+GOTO_ALREADY_PAID         — says payment is already done
+GOTO_CALLBACK             — busy, wants a callback later
+GOTO_DEATH                — mentions death of borrower or family member
+GOTO_FINANCIAL_DIFFICULTY — unable to pay, financial difficulty, needs time
+GOTO_REFUSAL              — flat-out refuses, no reason given
+MARK_UNCLEAR              — completely unintelligible
 
-GOTO_PTP            — customer agrees to pay (today, tomorrow, or soon)
-GOTO_CANNOT_PAY     — customer says they are unable to pay / needs time / financial difficulty
-GOTO_WILL_NOT_PAY   — customer flat-out refuses with no reason
-GOTO_ALREADY_PAID   — customer says payment is already done
-GOTO_NO_LOAN        — wrong person, wrong number, or denies having this loan
-GOTO_WRONG_EMI      — customer disputes the EMI amount
-ANSWER_FAQ_WHO_ARE_YOU — customer asks who you are or why you're calling
-MARK_UNCLEAR        — completely unintelligible, pure noise, or silence
+When between FINANCIAL_DIFFICULTY and REFUSAL, prefer FINANCIAL_DIFFICULTY.""",
 
-When in doubt between GOTO_CANNOT_PAY and GOTO_WILL_NOT_PAY, choose GOTO_CANNOT_PAY.""",
-
-    "already_paid_ask_date": """\
-The agent asked: "किस तारीख को payment किया था?" (What date was the payment made?)
+    "offer_partial": """\
+The agent offered: "Kya aap partial payment kar sakte hain?"
 The customer said: "{utterance}"
 
-Choose EXACTLY ONE label:
-GOTO_ALREADY_PAID_MODE — customer gave any date, approximate time, or said they don't remember
-MARK_UNCLEAR           — completely unintelligible or no response at all""",
+Output EXACTLY ONE:
+GOTO_PARTIAL_YES — accepts partial payment offer
+GOTO_PARTIAL_NO  — declines""",
 
-    "already_paid_ask_mode": """\
-The agent asked: "payment किस तरीके से किया था?" (How was the payment made?)
+    "refusal_ask_reason": """\
+The agent asked: "Aap payment kyun nahi kar pa rahe?"
 The customer said: "{utterance}"
 
-Choose EXACTLY ONE label:
-GOTO_ALREADY_PAID_THANKS — customer mentioned any payment method (even vaguely)
-MARK_UNCLEAR             — completely unintelligible or no response at all""",
+Output EXACTLY ONE:
+GOT_REASON     — gave any reason (even vague)
+STILL_REFUSING — refuses to give any reason""",
+
+    "refusal_escalate": """\
+The agent asked again: "Koi specific wajah?"
+The customer said: "{utterance}"
+
+Output EXACTLY ONE:
+GOT_REASON     — gave any reason
+STILL_REFUSING — still refuses""",
 }
 
 _LLM_KEYWORD_MAP: dict[str, str] = {
-    "GOTO_PTP":               "goto_ptp",
-    "GOTO_CANNOT_PAY":        "goto_cannot_pay",
-    "GOTO_WILL_NOT_PAY":      "goto_will_not_pay",
-    "GOTO_ALREADY_PAID":      "goto_already_paid",
-    "GOTO_NO_LOAN":           "goto_no_loan",
-    "GOTO_WRONG_EMI":         "goto_wrong_emi",
-    "ANSWER_FAQ_WHO_ARE_YOU": "answer_faq_who_are_you",
-    "GOTO_ALREADY_PAID_MODE": "goto_already_paid_mode",
-    "GOTO_ALREADY_PAID_THANKS": "goto_already_paid_thanks",
-    "MARK_UNCLEAR":           "mark_unclear",
+    "GOTO_PAY_NOW":              "goto_pay_now",
+    "GOTO_PARTIAL":              "goto_partial",
+    "GOTO_FUTURE_PROMISE":       "goto_future_promise",
+    "GOTO_ALREADY_PAID":         "goto_already_paid",
+    "GOTO_CALLBACK":             "goto_callback",
+    "GOTO_DEATH":                "goto_death",
+    "GOTO_FINANCIAL_DIFFICULTY": "goto_financial_difficulty",
+    "GOTO_REFUSAL":              "goto_refusal",
+    "GOTO_PARTIAL_YES":          "goto_partial_yes",
+    "GOTO_PARTIAL_NO":           "goto_partial_no",
+    "GOT_REASON":                "got_reason",
+    "STILL_REFUSING":            "still_refusing",
+    "MARK_UNCLEAR":              "mark_unclear",
 }
 
 
 async def classify(utterance: str, state: str) -> str:
-    """
-    Classify a customer utterance for the given FSM state.
-    Rule-based first; LLM (Sarvam-M) fallback for genuinely ambiguous input.
-    """
-    # 1. Rule-based — fast, deterministic, no network call
+    """Rule-based first; Sarvam-M LLM fallback for ambiguous input."""
     result = _heuristic(utterance, state)
     if result is not None:
         log.info("CLASSIFY[rule] %s → %s | %r", state, result, utterance[:60])
         return result
 
-    # 2. Sarvam-M fallback — handles edge cases the rules don't cover
     prompt_template = _LLM_CLASSIFY_PROMPTS.get(state)
     if not prompt_template:
         return "mark_unclear"
 
-    prompt = prompt_template.format(utterance=utterance)
     try:
         resp = await _oai.chat.completions.create(
             model=LLM_MODEL,
-            messages=[{"role": "user", "content": prompt}],
+            messages=[{"role": "user", "content": prompt_template.format(utterance=utterance)}],
             temperature=0,
-            max_tokens=512,  # thinking model needs room to reason before emitting the keyword
+            max_tokens=512,
         )
         raw_full = (resp.choices[0].message.content or "").strip()
-        # Strip <think>...</think> chain-of-thought blocks before keyword matching
         raw = re.sub(r"<think>.*?</think>", "", raw_full, flags=re.DOTALL | re.IGNORECASE).strip().upper()
-        log.info("CLASSIFY[llm] raw=%r", raw[:120])
+        log.info("CLASSIFY[llm] raw=%r", raw[:100])
         for kw in sorted(_LLM_KEYWORD_MAP, key=len, reverse=True):
             if kw in raw:
                 result = _LLM_KEYWORD_MAP[kw]
@@ -429,7 +729,6 @@ async def classify(utterance: str, state: str) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 # TTS — Sarvam Bulbul v3
 # ─────────────────────────────────────────────────────────────────────────────
-
 def _tts_payload(text: str) -> dict:
     return {
         "text":                 text,
@@ -460,7 +759,6 @@ async def tts_stream(
     on_chunk: Callable[[bytes], Awaitable[None]],
     abort: list[bool],
 ) -> bool:
-    """Stream TTS audio chunks to caller. Returns True on success."""
     try:
         async with _http.stream(
             "POST", SARVAM_TTS_STREAM_URL,
@@ -481,8 +779,6 @@ async def tts_stream(
                     return True
                 if not chunk:
                     continue
-
-                # Detect container type from the first bytes
                 if container is None:
                     probe = chunk[:12]
                     if probe.startswith(b"RIFF") and b"WAVE" in probe:
@@ -495,20 +791,18 @@ async def tts_stream(
                 if container == "raw":
                     got_audio = True
                     await on_chunk(chunk)
-
                 elif container == "json":
                     tail = await resp.aread()
                     try:
                         data = json.loads((chunk + tail).decode("utf-8", errors="ignore"))
-                        b64 = (data.get("audios") or [None])[0] or data.get("audio")
+                        b64  = (data.get("audios") or [None])[0] or data.get("audio")
                         if b64:
                             got_audio = True
                             await on_chunk(base64.b64decode(b64))
                     except Exception as exc:
-                        log.warning("TTS JSON decode failed: %s", exc)
+                        log.warning("TTS JSON decode: %s", exc)
                     return got_audio
-
-                else:  # WAV — strip RIFF header
+                else:
                     if not wav_started:
                         wav_buf += chunk
                         idx = wav_buf.find(b"data")
@@ -525,22 +819,18 @@ async def tts_stream(
                         got_audio = True
                         await on_chunk(chunk)
 
-        if not got_audio:
-            log.warning("TTS stream: response ended with no audio")
         return got_audio
-
     except Exception as exc:
-        log.error("TTS stream error (%s): %s", type(exc).__name__, exc)
+        log.error("TTS stream error: %s", exc)
         return False
 
 
 async def tts_rest(text: str) -> bytes:
-    """Fallback blocking TTS — full audio before first byte out."""
     r = await _http.post(SARVAM_TTS_REST_URL, json=_tts_payload(text), headers=_tts_headers())
     if r.status_code >= 400:
         raise RuntimeError(f"TTS REST {r.status_code}: {r.text[:200]}")
     data = r.json()
-    b64 = (data.get("audios") or [None])[0] or data.get("audio")
+    b64  = (data.get("audios") or [None])[0] or data.get("audio")
     if not b64:
         raise RuntimeError("TTS REST: no audio in response")
     return base64.b64decode(b64)
@@ -551,25 +841,28 @@ async def tts_rest(text: str) -> bytes:
 # ─────────────────────────────────────────────────────────────────────────────
 @dataclasses.dataclass
 class CallSession:
-    ctx:             dict[str, str]
-    stream_sid:      str = ""
-    call_sid:        str = ""
-    state:           str = "opening"
-    done:            bool = False
-    speaking:        bool = False
-    unclear_count:   int  = 0
-    marks_out:       int  = 0
-    last_queued:     str  = ""
-    last_interim:    str  = ""
-    transcript_path: str  = ""
+    ctx:              dict[str, str]   # customer data + dynamic per-turn values
+    stream_sid:       str  = ""
+    call_sid:         str  = ""
+    state:            str  = "opening"
+    done:             bool = False
+    speaking:         bool = False
+    unclear_count:    int  = 0
+    marks_out:        int  = 0
+    last_queued:      str  = ""
+    last_interim:     str  = ""
+    transcript_path:  str  = ""
+    # workflow state
+    partial_attempts: int  = 0   # retries in partial_ask_amount
+    date_retries:     int  = 0   # retries in date-capture states
+    refusal_attempts: int  = 0   # escalation counter in refusal flow
+    partial_offered:  bool = False  # ensure partial offered only once
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # FastAPI app
 # ─────────────────────────────────────────────────────────────────────────────
 app = FastAPI(title="Aditi — Hindi EMI Collection Voice Bot")
-
-# call_sid → per-call customer context (set by /make-call, consumed at call start)
 _pending_ctx: dict[str, dict[str, str]] = {}
 
 
@@ -591,10 +884,10 @@ async def make_call(
     if MAKE_CALL_API_KEY and x_api_key != MAKE_CALL_API_KEY:
         raise HTTPException(status_code=401, detail="Invalid or missing X-Api-Key")
     body = await request.json()
-    to = (body.get("to") or "").strip()
+    to   = (body.get("to") or "").strip()
     if not to:
         raise HTTPException(status_code=422, detail="`to` (phone number) is required")
-    ctx = {**DEFAULT_CUSTOMER, **{k: str(v) for k, v in body.items() if k != "to"}}
+    ctx  = {**DEFAULT_CUSTOMER, **{k: str(v) for k, v in body.items() if k != "to"}}
     call = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN).calls.create(
         url=f"{NGROK_URL}/outgoing-call", to=to, from_=TWILIO_PHONE_NUMBER,
     )
@@ -622,10 +915,24 @@ async def media_stream(twilio_ws: WebSocket) -> None:
     log.info("Twilio media stream connected")
 
     sess  = CallSession(ctx=dict(DEFAULT_CUSTOMER))
-    abort = [False]                         # mutable barge-in flag shared across tasks
+    abort = [False]
     utt_q: asyncio.Queue[str] = asyncio.Queue()
     drained = asyncio.Event()
     drained.set()
+
+    # Per-call spectral denoiser (CPU-bound → runs in thread pool)
+    _denoiser  = (
+        _StreamDenoiser(prop_decrease=DENOISE_STRENGTH, profile_sec=DENOISE_PROFILE_SEC)
+        if DENOISE_ENABLED else None
+    )
+    _denoise_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    _loop      = asyncio.get_event_loop()
+
+    # Per-call WebRTC VAD noise gate — runs AFTER denoising
+    # Each Twilio mulaw frame (160 bytes) → 320 bytes PCM16 = exactly 20 ms at 8 kHz
+    _vad_inst          = webrtcvad.Vad(VAD_MODE) if VAD_ENABLED else None
+    _vad_hangover_left = [0]  # frames remaining in hangover window
+    _VAD_HANGOVER_FRAMES = max(1, VAD_HANGOVER_MS // 20)
 
     try:
         stt_ws = await websockets.connect(
@@ -647,10 +954,7 @@ async def media_stream(twilio_ws: WebSocket) -> None:
                 sess.transcript_path = f"{TRANSCRIPTS_DIR}/{ts}_{sid}.jsonl"
             row = {
                 "ts":    datetime.now(timezone.utc).isoformat(timespec="milliseconds") + "Z",
-                "event": event,
-                "state": sess.state,
-                "sid":   sess.call_sid,
-                **fields,
+                "event": event, "state": sess.state, "sid": sess.call_sid, **fields,
             }
             try:
                 with open(sess.transcript_path, "a", encoding="utf-8") as fh:
@@ -658,7 +962,7 @@ async def media_stream(twilio_ws: WebSocket) -> None:
             except OSError:
                 pass
 
-        # ── Push 20 ms µ-law frames to Twilio ───────────────────────────────
+        # ── Push µ-law frames to Twilio ──────────────────────────────────────
         async def push(chunk: bytes) -> None:
             if sess.done or abort[0] or not sess.stream_sid:
                 return
@@ -670,15 +974,13 @@ async def media_stream(twilio_ws: WebSocket) -> None:
                     if not frame:
                         return
                     await twilio_ws.send_json({
-                        "event":     "media",
-                        "streamSid": sess.stream_sid,
-                        "media":     {"payload": base64.b64encode(frame).decode()},
+                        "event": "media", "streamSid": sess.stream_sid,
+                        "media": {"payload": base64.b64encode(frame).decode()},
                     })
                     await asyncio.sleep(0)
             except Exception:
                 pass
 
-        # ── Mark event — lets hangup() know audio has played ────────────────
         async def send_mark() -> None:
             if sess.done or not sess.stream_sid:
                 return
@@ -686,14 +988,13 @@ async def media_stream(twilio_ws: WebSocket) -> None:
             sess.marks_out += 1
             try:
                 await twilio_ws.send_json({
-                    "event":     "mark",
-                    "streamSid": sess.stream_sid,
-                    "mark":      {"name": "tts_done"},
+                    "event": "mark", "streamSid": sess.stream_sid,
+                    "mark":  {"name": "tts_done"},
                 })
             except Exception:
                 pass
 
-        # ── Play TTS: streaming with REST fallback ───────────────────────────
+        # ── TTS ───────────────────────────────────────────────────────────────
         async def play_tts(text: str) -> None:
             text = text.strip()
             if not text or sess.done or not sess.stream_sid:
@@ -704,7 +1005,7 @@ async def media_stream(twilio_ws: WebSocket) -> None:
             try:
                 ok = await tts_stream(text, push, abort)
                 if not ok and not sess.done:
-                    log.warning("TTS stream failed — falling back to REST")
+                    log.warning("TTS stream failed — REST fallback")
                     audio = await tts_rest(text)
                     await push(_strip_wav_header(audio))
                 if not sess.done:
@@ -715,12 +1016,10 @@ async def media_stream(twilio_ws: WebSocket) -> None:
                 sess.speaking = False
             log.info("TTS %.0f ms | %.60s", (time.perf_counter() - t0) * 1000, text)
 
-        # ── SafeMap for template substitution ───────────────────────────────
         class _SafeMap(dict):
             def __missing__(self, key: str) -> str:
                 return f"{{{key}}}"
 
-        # ── Speak a scripted line (template-fills customer vars) ─────────────
         async def speak(text: str) -> None:
             text = text.format_map(_SafeMap(sess.ctx))
             log.info("[ADITI] %s", text)
@@ -732,7 +1031,7 @@ async def media_stream(twilio_ws: WebSocket) -> None:
             if script:
                 await speak(script)
 
-        # ── Graceful hangup ──────────────────────────────────────────────────
+        # ── Hangup ───────────────────────────────────────────────────────────
         async def hangup(reason: str = "unknown") -> None:
             if sess.done:
                 return
@@ -740,16 +1039,12 @@ async def media_stream(twilio_ws: WebSocket) -> None:
             abort[0]  = True
             log.info("Hangup: %s", reason)
             record("hangup", reason=reason)
-
-            # Wait for Twilio to drain queued audio
             if sess.marks_out > 0:
                 try:
                     await asyncio.wait_for(drained.wait(), timeout=7.0)
                 except asyncio.TimeoutError:
                     log.warning("Hangup: audio drain timeout")
-
             await asyncio.sleep(HANGUP_GRACE_SEC)
-
             if sess.call_sid:
                 try:
                     TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)\
@@ -757,14 +1052,24 @@ async def media_stream(twilio_ws: WebSocket) -> None:
                     log.info("Call %s terminated", sess.call_sid)
                 except Exception as exc:
                     log.error("Twilio hangup error: %s", exc)
-
             for ws in (stt_ws, twilio_ws):
                 try:
                     await ws.close()
                 except Exception:
                     pass
 
-        # ── Twilio media stream receiver ─────────────────────────────────────
+        # ── Transition helper ────────────────────────────────────────────────
+        async def go(state: str, *, reset_unclear: bool = True) -> None:
+            """Speak the scripted line for state, hang up if terminal."""
+            log.info("FSM %s → %s", sess.state, state)
+            sess.state = state
+            if reset_unclear:
+                sess.unclear_count = 0
+            await speak_state(state)
+            if state in _TERMINAL:
+                asyncio.create_task(hangup(state))
+
+        # ── Twilio receiver ──────────────────────────────────────────────────
         async def recv_twilio() -> None:
             opened = False
             try:
@@ -777,7 +1082,6 @@ async def media_stream(twilio_ws: WebSocket) -> None:
                     if evt == "start":
                         sess.stream_sid = data["start"]["streamSid"]
                         sess.call_sid   = data["start"].get("callSid", "")
-                        # Restore per-call customer context
                         if sess.call_sid in _pending_ctx:
                             sess.ctx = _pending_ctx.pop(sess.call_sid)
                         log.info("Stream=%s Call=%s", sess.stream_sid, sess.call_sid)
@@ -792,6 +1096,23 @@ async def media_stream(twilio_ws: WebSocket) -> None:
                         raw_audio = base64.b64decode(data["media"]["payload"])
                         try:
                             pcm16 = audioop.ulaw2lin(raw_audio, 2)
+                            # Step 1: spectral noise cancellation (in thread pool)
+                            if _denoiser is not None:
+                                pcm16 = await _loop.run_in_executor(
+                                    _denoise_pool, _denoiser.feed_sync, pcm16
+                                )
+                            # Step 2: VAD gate — mute frames that contain no speech
+                            if _vad_inst is not None and len(pcm16) == 320:
+                                try:
+                                    is_speech = _vad_inst.is_speech(pcm16, 8000)
+                                except Exception:
+                                    is_speech = True  # on error, pass through
+                                if is_speech:
+                                    _vad_hangover_left[0] = _VAD_HANGOVER_FRAMES
+                                elif _vad_hangover_left[0] > 0:
+                                    _vad_hangover_left[0] -= 1
+                                else:
+                                    pcm16 = b"\x00" * 320  # silence non-speech frame
                             await stt_ws.send(json.dumps({
                                 "audio": {
                                     "data":        base64.b64encode(pcm16).decode(),
@@ -813,7 +1134,7 @@ async def media_stream(twilio_ws: WebSocket) -> None:
                             drained.set()
 
             except WebSocketDisconnect:
-                log.info("Twilio WebSocket disconnected")
+                log.info("Twilio WS disconnected")
             except RuntimeError as exc:
                 if "WebSocket is not connected" not in str(exc):
                     raise
@@ -839,7 +1160,6 @@ async def media_stream(twilio_ws: WebSocket) -> None:
                     msg_type = str(frame.get("type", "")).lower()
                     inner    = frame.get("data") if isinstance(frame.get("data"), dict) else {}
 
-                    # ── VAD events ───────────────────────────────────────────
                     if msg_type == "events":
                         signal = str(inner.get("signal_type", "")).upper()
                         if signal == "START_SPEECH" and sess.speaking:
@@ -859,7 +1179,6 @@ async def media_stream(twilio_ws: WebSocket) -> None:
                         log.error("STT error: %s", frame)
                         continue
 
-                    # ── Final transcript ─────────────────────────────────────
                     transcript = (
                         inner.get("transcript")
                         or frame.get("transcript")
@@ -880,7 +1199,6 @@ async def media_stream(twilio_ws: WebSocket) -> None:
                     if is_final:
                         if sess.done or transcript == sess.last_queued:
                             continue
-                        # Barge-in: abort TTS if bot is currently speaking
                         if sess.speaking:
                             abort[0] = True
                             log.info("Barge-in utterance: %s", transcript)
@@ -906,27 +1224,24 @@ async def media_stream(twilio_ws: WebSocket) -> None:
         async def fsm() -> None:
 
             async def handle_unclear() -> bool:
-                """Increment unclear counter, speak prompt, return True if call should end."""
                 sess.unclear_count += 1
                 target = (
                     "unclear_sm1"  if sess.unclear_count == 1 else
                     "unclear_sm2"  if sess.unclear_count == 2 else
                     "unclear_close"
                 )
-                old_state  = sess.state
+                old = sess.state
                 sess.state = target
-                log.info("FSM unclear %d: %s → %s", sess.unclear_count, old_state, target)
+                log.info("FSM unclear %d: %s → %s", sess.unclear_count, old, target)
                 record("unclear", target=target)
                 await speak_state(target)
                 if target == "unclear_close":
                     asyncio.create_task(hangup("no_response"))
                     return True
-                # Auto-advance back to the classifying state
                 sess.state = _AUTO_ADVANCE.get(target, "opening")
                 return False
 
             while not sess.done:
-                # Wait for the next utterance (or silence timeout)
                 try:
                     utterance = await asyncio.wait_for(utt_q.get(), timeout=SILENCE_TIMEOUT_SEC)
                 except asyncio.TimeoutError:
@@ -940,54 +1255,293 @@ async def media_stream(twilio_ws: WebSocket) -> None:
                 if sess.done:
                     break
 
+                # Wait briefly then drain any follow-up fragments that arrived
+                # while Sarvam STT was still finalising the full sentence.
+                await asyncio.sleep(POST_UTTERANCE_PAUSE_SEC)
+                while not utt_q.empty():
+                    try:
+                        utterance = utt_q.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+
                 utterance = utterance.strip() or "[silence]"
                 record("user_turn", text=utterance)
+                log.debug("FSM state=%s utterance=%r", sess.state, utterance)
 
-                if sess.state not in _CLASSIFY_STATES:
-                    # Should not happen in normal flow — log and skip
-                    log.warning("FSM: utterance received in non-classify state %s — ignoring", sess.state)
-                    continue
+                # ══════════════════════════════════════════════════════════════
+                # ROOT: OPENING
+                # ══════════════════════════════════════════════════════════════
+                if sess.state == "opening":
+                    action = await classify(utterance, "opening")
+                    record("classify", action=action)
 
-                # ── Classify and transition ───────────────────────────────────
-                t0     = time.perf_counter()
-                action = await classify(utterance, sess.state)
-                elapsed = (time.perf_counter() - t0) * 1000
-                log.info("CLASSIFY %s → %s (%.0f ms)", sess.state, action, elapsed)
-                record("classify", action=action, ms=round(elapsed))
-
-                if action == "mark_unclear":
-                    if await handle_unclear():
+                    if action == "goto_pay_now":
+                        await go("full_payment_today")
                         break
-                    continue
 
-                next_state = _TRANSITIONS.get(action)
-                if not next_state:
-                    log.warning("FSM: unknown action %r → treating as unclear", action)
-                    if await handle_unclear():
+                    elif action == "goto_partial":
+                        sess.partial_offered = True
+                        await go("partial_ask_amount")
+
+                    elif action == "goto_future_promise":
+                        # Try to extract date from the same utterance (e.g. "अगले महीने")
+                        d = _parse_date(utterance)
+                        _today = _date.today()
+                        if d and d > _today:
+                            if d > _today + timedelta(days=90):
+                                d = _today + timedelta(days=90)
+                            sess.ctx["payment_date"] = _fmt_date(d)
+                            await go("future_confirm")
+                            break
+                        await go("future_ask_date")
+
+                    elif action == "goto_already_paid":
+                        await go("already_paid_ask_date")
+
+                    elif action == "goto_callback":
+                        # Capture callback time if already mentioned
+                        d = _parse_date(utterance)
+                        _today = _date.today()
+                        if d and d >= _today:
+                            sess.ctx["callback_time"] = _fmt_date(d)
+                            await go("callback_confirm")
+                            break
+                        await go("callback_ask_time")
+
+                    elif action == "goto_death":
+                        await go("death_response")
                         break
-                    continue
 
-                log.info("FSM %s → %s", sess.state, next_state)
-                sess.state = next_state
-                sess.unclear_count = 0      # reset on successful exchange
-                await speak_state(next_state)
+                    elif action == "goto_financial_difficulty":
+                        if not sess.partial_offered:
+                            sess.partial_offered = True
+                            await go("offer_partial")
+                        else:
+                            # partial already offered once — go to refusal flow
+                            await go("refusal_ask_reason")
+
+                    elif action == "goto_refusal":
+                        await go("refusal_ask_reason")
+
+                    elif action == "mark_unclear":
+                        if await handle_unclear():
+                            break
+
+                # ══════════════════════════════════════════════════════════════
+                # C2 BRIDGE: OFFER PARTIAL (one-time after financial difficulty)
+                # ══════════════════════════════════════════════════════════════
+                elif sess.state == "offer_partial":
+                    action = await classify(utterance, "offer_partial")
+                    record("classify", action=action)
+
+                    if action == "goto_partial_yes":
+                        await go("partial_ask_amount")
+                    else:
+                        # declined partial → refusal flow
+                        await go("refusal_ask_reason")
+
+                # ══════════════════════════════════════════════════════════════
+                # C2: PARTIAL PAYMENT — capture amount
+                # ══════════════════════════════════════════════════════════════
+                elif sess.state == "partial_ask_amount":
+                    amount = _parse_amount(utterance)
+                    min_p  = int(sess.ctx.get("min_partial_int", "1500"))
+
+                    if amount is None:
+                        sess.partial_attempts += 1
+                        if sess.partial_attempts >= 2:
+                            await go("refusal_ask_reason")
+                        else:
+                            await speak_state("partial_amount_unclear")
+                        continue
+
+                    if amount < min_p:
+                        sess.partial_attempts += 1
+                        if sess.partial_attempts >= 2:
+                            await go("refusal_ask_reason")
+                        else:
+                            await speak_state("partial_amount_too_low")
+                        continue
+
+                    emi_int = int(re.sub(r"[^0-9]", "", sess.ctx.get("emi_amount_int", "8500")))
+                    remaining = max(0, emi_int - amount)
+                    sess.ctx["partial_amount"]   = f"{amount:,}"
+                    sess.ctx["remaining_balance"] = f"{remaining:,}"
+                    sess.partial_attempts = 0
+                    await go("partial_ask_remaining_date")
+
+                # ── C2: capture remaining balance date ────────────────────────
+                elif sess.state == "partial_ask_remaining_date":
+                    d = _parse_date(utterance)
+                    today = _date.today()
+
+                    if d is None:
+                        sess.date_retries += 1
+                        if sess.date_retries >= 2:
+                            # default to 7 days out
+                            d = today + timedelta(days=7)
+                        else:
+                            await speak_state("partial_date_retry")
+                            continue
+
+                    if d < today:
+                        d = today + timedelta(days=7)
+                    if d > today + timedelta(days=90):
+                        d = today + timedelta(days=90)
+
+                    sess.ctx["payment_date"] = _fmt_date(d)
+                    sess.date_retries = 0
+                    await go("partial_confirm")
+                    break
+
+                # ══════════════════════════════════════════════════════════════
+                # C3: FUTURE PAYMENT PROMISE — capture date
+                # ══════════════════════════════════════════════════════════════
+                elif sess.state == "future_ask_date":
+                    d = _parse_date(utterance)
+                    today = _date.today()
+
+                    if d is None:
+                        sess.date_retries += 1
+                        if sess.date_retries >= 2:
+                            d = today + timedelta(days=7)
+                        else:
+                            await speak_state("future_date_retry")
+                            continue
+
+                    if d < today:
+                        d = today
+                    if d > today + timedelta(days=90):
+                        d = today + timedelta(days=90)
+
+                    sess.ctx["payment_date"] = _fmt_date(d)
+                    sess.date_retries = 0
+                    await go("future_confirm")
+                    break
+
+                # ══════════════════════════════════════════════════════════════
+                # C5: REFUSAL — ask reason (first attempt)
+                # ══════════════════════════════════════════════════════════════
+                elif sess.state == "refusal_ask_reason":
+                    action = await classify(utterance, "refusal_ask_reason")
+                    record("classify", action=action)
+
+                    if action == "got_reason":
+                        sess.ctx["refusal_reason"] = utterance[:120]
+                        await go("refusal_credit_warn")
+
+                    else:  # still_refusing
+                        sess.refusal_attempts += 1
+                        if sess.refusal_attempts >= 1:
+                            await go("refusal_escalate")
+                        else:
+                            await speak_state("refusal_ask_reason")
+
+                # ── C5: refusal escalate (second attempt) ─────────────────────
+                elif sess.state == "refusal_escalate":
+                    action = await classify(utterance, "refusal_escalate")
+                    record("classify", action=action)
+
+                    if action == "got_reason":
+                        sess.ctx["refusal_reason"] = utterance[:120]
+                    else:
+                        sess.ctx.setdefault("refusal_reason", "Unspecified")
+
+                    await go("refusal_credit_warn")
+
+                # ── C5: credit warning + ask callback time ────────────────────
+                elif sess.state == "refusal_credit_warn":
+                    # Any response is treated as callback preference
+                    d = _parse_date(utterance)
+                    if d and d >= _date.today():
+                        sess.ctx["callback_time"] = _fmt_date(d)
+                    elif utterance and utterance != "[silence]":
+                        sess.ctx["callback_time"] = _clean_callback_time(utterance)
+                    else:
+                        sess.ctx.setdefault("callback_time", "जल्द ही")
+                    await go("refusal_close")
+                    break
+
+                # ══════════════════════════════════════════════════════════════
+                # C6: ALREADY PAID — capture date
+                # ══════════════════════════════════════════════════════════════
+                elif sess.state == "already_paid_ask_date":
+                    d = _parse_date(utterance)
+                    today = _date.today()
+
+                    if d is None:
+                        sess.date_retries += 1
+                        if sess.date_retries >= 2:
+                            sess.ctx["payment_date"] = "recently"
+                            sess.date_retries = 0
+                            await go("already_paid_ask_mode")
+                        else:
+                            await speak_state("already_paid_date_unclear")
+                        continue
+
+                    if d > today:
+                        sess.date_retries += 1
+                        if sess.date_retries >= 2:
+                            sess.ctx["payment_date"] = "recently"
+                            sess.date_retries = 0
+                            await go("already_paid_ask_mode")
+                        else:
+                            await speak_state("already_paid_date_invalid")
+                        continue
+
+                    sess.ctx["payment_date"] = _fmt_date(d)
+                    sess.date_retries = 0
+                    await go("already_paid_ask_mode")
+
+                # ── C6: capture payment mode ──────────────────────────────────
+                elif sess.state == "already_paid_ask_mode":
+                    # Accept any substantive response
+                    sess.ctx["payment_mode"] = utterance[:80] if utterance != "[silence]" else "not specified"
+                    await go("already_paid_confirm")
+                    break
+
+                # ══════════════════════════════════════════════════════════════
+                # C7: CALLBACK — capture time
+                # ══════════════════════════════════════════════════════════════
+                elif sess.state == "callback_ask_time":
+                    d = _parse_date(utterance)
+                    today = _date.today()
+
+                    if d and d >= today:
+                        sess.ctx["callback_time"] = _fmt_date(d)
+                        sess.date_retries = 0
+                    elif utterance and utterance != "[silence]":
+                        sess.ctx["callback_time"] = _clean_callback_time(utterance)
+                        sess.date_retries = 0
+                    else:
+                        sess.date_retries += 1
+                        if sess.date_retries >= 2:
+                            sess.ctx["callback_time"] = "जल्द ही"
+                        else:
+                            await speak_state("callback_time_unclear")
+                            continue
+
+                    await go("callback_confirm")
+                    break
+
+                # ══════════════════════════════════════════════════════════════
+                # C5 continuation: credit warn auto-entered via speak + next utt
+                # (refusal_credit_warn is not an auto-advance state; it waits for
+                #  the callback time response in the loop above)
+                # ══════════════════════════════════════════════════════════════
+
+                else:
+                    log.warning("FSM: unhandled state %s — skipping utterance", sess.state)
 
                 if sess.done:
                     break
 
-                if next_state in _TERMINAL:
-                    asyncio.create_task(hangup(next_state))
-                    break
-
-                if next_state in _AUTO_ADVANCE:
-                    sess.state = _AUTO_ADVANCE[next_state]
-
             log.info("FSM ended (state=%s)", sess.state)
 
-        # ── Run all three coroutines concurrently ────────────────────────────
         await asyncio.gather(recv_twilio(), recv_sarvam_stt(), fsm())
 
     finally:
+        _denoise_pool.shutdown(wait=False)
         try:
             await stt_ws.close()
         except Exception:
