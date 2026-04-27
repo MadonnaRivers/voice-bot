@@ -1,6 +1,0 @@
-## STATE: UNCLEAR_SM1
-
-Speak exactly:
-"माफ़ कीजिए, आवाज़ साफ़ नहीं आई। क्या आप आज EMI payment कर पाएंगे — हाँ या नहीं?"
-
-No tool call in this state. Wait for customer response.

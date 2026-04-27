@@ -1,6 +1,0 @@
-## STATE: NO_LOAN
-
-Speak exactly:
-"ठीक है, हम रिकॉर्ड जाँचेंगे। किसी भी सहायता के लिए Easy Home Finance customer care से संपर्क कर सकते हैं। धन्यवाद, आपका दिन शुभ हो।"
-
-Then: end_call(reason="no_loan")

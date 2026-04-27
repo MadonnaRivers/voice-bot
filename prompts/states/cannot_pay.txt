@@ -1,6 +1,0 @@
-## STATE: CANNOT_PAY
-
-Speak exactly:
-"मैं आपकी बात समझ सकती हूँ। जैसे ही संभव हो EMI जमा कर दीजिए, ताकि penalty और CIBIL पर असर न पड़े। मदद चाहिए तो customer care से बात कर सकते हैं।"
-
-Then: end_call(reason="cannot_pay")

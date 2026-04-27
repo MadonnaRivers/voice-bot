@@ -1,6 +1,0 @@
-## STATE: WRONG_EMI
-
-Speak exactly:
-"राशि संबंधी आपकी आपत्ति दर्ज कर ली गई है। सही जानकारी के लिए अपने relationship manager या customer care से संपर्क करें — वे मदद करेंगे। धन्यवाद।"
-
-Then: end_call(reason="dispute")

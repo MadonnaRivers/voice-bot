@@ -1,6 +1,0 @@
-## STATE: WILL_NOT_PAY
-
-Speak exactly:
-"ठीक है, आपकी बात नोट कर ली गई है। कृपया ध्यान रखें, बकाया EMI रहने पर penalty और CIBIL score पर असर पड़ सकता है। धन्यवाद।"
-
-Then: end_call(reason="refuse_to_pay")

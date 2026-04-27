@@ -1,6 +1,0 @@
-## STATE: UNCLEAR_SM2
-
-Speak exactly:
-"एक बार और कोशिश करते हैं — बस हाँ या नहीं बोलिए, क्या आज EMI भर पाएंगे?"
-
-No tool call in this state. Wait for customer response.

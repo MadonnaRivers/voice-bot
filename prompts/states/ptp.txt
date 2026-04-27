@@ -1,6 +1,0 @@
-## STATE: PTP_CONFIRMATION
-
-Speak exactly:
-"बहुत अच्छा! SMS में आया payment link या नज़दीकी branch से EMI जमा कर दें। समय पर payment से penalty और CIBIL score दोनों सुरक्षित रहेंगे। धन्यवाद, आपका दिन शुभ हो।"
-
-Then: end_call(reason="ptp_secured")
