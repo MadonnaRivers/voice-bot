@@ -90,25 +90,29 @@ PORT                = int(os.getenv("PORT",             "5050"))
 TRANSCRIPTS_DIR     = os.getenv("TRANSCRIPTS_DIR",     "transcripts")
 MAKE_CALL_API_KEY   = os.getenv("MAKE_CALL_API_KEY",   "")
 
-HANGUP_GRACE_SEC    = float(os.getenv("HANGUP_GRACE_SEC",    "1.5"))
-SILENCE_TIMEOUT_SEC = float(os.getenv("SILENCE_TIMEOUT_SEC", "20.0"))
-TTS_PACE            = float(os.getenv("TTS_PACE",            "1.1"))
+HANGUP_GRACE_SEC     = float(os.getenv("HANGUP_GRACE_SEC",     "1.5"))
+SILENCE_TIMEOUT_SEC  = float(os.getenv("SILENCE_TIMEOUT_SEC",  "20.0"))
+TTS_PACE             = float(os.getenv("TTS_PACE",             "1.1"))
+# Minimum seconds into a TTS play before barge-in is honoured.
+# Prevents pickup-tone / Twilio-connect audio from aborting the opening.
+BARGE_IN_GUARD_SEC   = float(os.getenv("BARGE_IN_GUARD_SEC",   "1.5"))
 
 # Noise gate — WebRTC VAD silences non-speech frames before they reach STT
 # VAD_MODE: 0 = least aggressive, 3 = most aggressive noise suppression
-VAD_MODE           = int(os.getenv("VAD_MODE",           "2"))
-VAD_HANGOVER_MS    = int(os.getenv("VAD_HANGOVER_MS",    "300"))  # keep audio N ms after speech ends
-VAD_ENABLED        = os.getenv("VAD_ENABLED", "true").lower() not in ("0", "false", "no")
+VAD_MODE            = int(os.getenv("VAD_MODE",            "2"))
+VAD_HANGOVER_MS     = int(os.getenv("VAD_HANGOVER_MS",     "500"))  # keep audio N ms after speech ends — longer for Hindi pauses
+VAD_ENABLED         = os.getenv("VAD_ENABLED", "true").lower() not in ("0", "false", "no")
 
-# Spectral noise cancellation — noisereduce (runs in thread pool, ~17 ms / 80 ms chunk)
-DENOISE_ENABLED    = os.getenv("DENOISE_ENABLED",    "true").lower() not in ("0", "false", "no")
-DENOISE_STRENGTH   = float(os.getenv("DENOISE_STRENGTH",   "0.80"))  # 0.0–1.0
-DENOISE_PROFILE_SEC = float(os.getenv("DENOISE_PROFILE_SEC", "1.5")) # seconds of silence at call start used as noise reference
+# Spectral noise cancellation — noisereduce (runs in thread pool, ~20 ms / 80 ms chunk)
+DENOISE_ENABLED     = os.getenv("DENOISE_ENABLED",     "true").lower() not in ("0", "false", "no")
+DENOISE_STRENGTH    = float(os.getenv("DENOISE_STRENGTH",    "0.88"))  # 0.0–1.0; higher = more aggressive
+DENOISE_PROFILE_SEC = float(os.getenv("DENOISE_PROFILE_SEC", "2.0"))   # seconds for stationary noise profiling
+DENOISE_STATIONARY  = os.getenv("DENOISE_STATIONARY", "false").lower() not in ("0", "false", "no")
 
 # How long (seconds) the FSM waits after the first transcript arrives before responding.
 # Drains any follow-up STT fragments that arrive during this window so the bot
 # acts on the complete utterance instead of the first short chunk.
-POST_UTTERANCE_PAUSE_SEC = float(os.getenv("POST_UTTERANCE_PAUSE_SEC", "1.8"))
+POST_UTTERANCE_PAUSE_SEC = float(os.getenv("POST_UTTERANCE_PAUSE_SEC", "1.5"))
 
 SARVAM_STT_WS_URL = (
     f"{SARVAM_STT_WS_BASE}"
@@ -128,66 +132,113 @@ SARVAM_TTS_REST_URL   = "https://api.sarvam.ai/text-to-speech"
 # ─────────────────────────────────────────────────────────────────────────────
 # Spectral noise cancellation
 # ─────────────────────────────────────────────────────────────────────────────
+
+# First-order IIR highpass: removes low-freq rumble (traffic, AC, wind) below ~300 Hz.
+# alpha = RC / (RC + dt),  RC = 1/(2π·300),  dt = 1/8000  →  alpha ≈ 0.810
+_HP_ALPHA = 0.810
+
+# RMS energy threshold: frames below this are treated as silence for noise profiling.
+# Prevents "hello" at call-answer from poisoning the noise reference.
+_PROFILE_ENERGY_LIMIT = 0.025
+
 class _StreamDenoiser:
     """
-    Per-call spectral noise canceller.
+    Per-call noise canceller.
 
-    Pipeline:
-      Phase 1 (first DENOISE_PROFILE_SEC seconds): collect audio as a noise
-        reference — assumes the line is live but the customer hasn't spoken yet.
-      Phase 2: process incoming PCM-16 LE in 80 ms chunks via noisereduce
-        stationary subtraction; output with ~80 ms delay.
-
-    feed_sync() is CPU-bound; call it via loop.run_in_executor to keep the
-    asyncio event loop free.
+    Pipeline (runs entirely in thread pool via feed_sync):
+      1. IIR highpass @ ~300 Hz — removes traffic rumble, AC hum, wind.
+      2a. Non-stationary (default): rolling noise estimate adapts to changing
+          background (traffic, TV, crowds) using MMSE Wiener filter.
+      2b. Stationary (opt-in): build noise profile from silent frames, then
+          apply spectral subtraction — best for constant hum/fan noise.
+      3. Output delayed ~80 ms (one chunk behind).
     """
-    CHUNK_SAMP = 640    # 80 ms at 8 kHz — good FFT resolution, fits in ~17 ms CPU
+    CHUNK_SAMP = 640  # 80 ms @ 8 kHz
 
-    def __init__(self, sr: int = 8000, prop_decrease: float = 0.80,
-                 profile_sec: float = 1.5) -> None:
-        self._sr     = sr
-        self._prop   = prop_decrease
-        self._target = int(sr * profile_sec)
-        self._pbuf:   list[np.ndarray] = []
-        self._noise:  np.ndarray | None = None
+    def __init__(self, sr: int = 8000, prop_decrease: float = 0.88,
+                 profile_sec: float = 2.0, stationary: bool = False) -> None:
+        self._sr         = sr
+        self._prop       = prop_decrease
+        self._stationary = stationary
+        self._target     = int(sr * profile_sec)
+        # Stationary-mode profiling state
+        self._pbuf:    list[np.ndarray] = []
+        self._profiled = 0
+        self._noise:   np.ndarray | None = None
+        # Shared processing buffers
         self._inbuf  = np.zeros(0, dtype=np.float32)
         self._outbuf = np.zeros(0, dtype=np.float32)
+        # IIR highpass filter state
+        self._hp_px  = 0.0
+        self._hp_py  = 0.0
+
+    def _highpass(self, x: np.ndarray) -> np.ndarray:
+        """Remove low-frequency noise below ~300 Hz (traffic, AC, wind)."""
+        a = _HP_ALPHA
+        y = np.empty_like(x)
+        px, py = self._hp_px, self._hp_py
+        for i in range(len(x)):
+            v = a * (py + x[i] - px)
+            px, py = x[i], v
+            y[i] = v
+        self._hp_px, self._hp_py = px, py
+        return y
+
+    def _denoise(self, seg: np.ndarray) -> np.ndarray:
+        # Suppress divide-by-zero / invalid warnings from noisereduce on silent frames
+        with np.errstate(divide="ignore", invalid="ignore"):
+            if self._stationary:
+                out = nr.reduce_noise(
+                    y=seg, y_noise=self._noise, sr=self._sr,
+                    stationary=True, prop_decrease=self._prop,
+                    n_fft=512, n_jobs=1,
+                )
+            else:
+                out = nr.reduce_noise(
+                    y=seg, sr=self._sr,
+                    stationary=False, prop_decrease=self._prop,
+                    n_fft=512, n_jobs=1,
+                    time_constant_s=1.5,
+                )
+        # Replace NaN / Inf that noisereduce can produce on pure-silence frames
+        return np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+
+    def _emit(self, n: int, fallback: np.ndarray) -> bytes:
+        out = self._outbuf[:n] if self._outbuf.shape[0] >= n else fallback
+        if self._outbuf.shape[0] >= n:
+            self._outbuf = self._outbuf[n:]
+        out = np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+        return (np.clip(out, -1.0, 1.0) * 32768).astype(np.int16).tobytes()
 
     def feed_sync(self, pcm16: bytes) -> bytes:
-        chunk = np.frombuffer(pcm16, dtype=np.int16).astype(np.float32) / 32768.0
+        raw   = np.frombuffer(pcm16, dtype=np.int16).astype(np.float32) / 32768.0
+        chunk = self._highpass(raw)  # always apply highpass first
 
-        # ── Phase 1: noise profiling ──────────────────────────────────────────
-        if self._noise is None:
-            self._pbuf.append(chunk)
-            if sum(a.shape[0] for a in self._pbuf) >= self._target:
-                self._noise = np.concatenate(self._pbuf)
+        # ── Stationary: phase 1 — build noise profile from silent frames ──────
+        if self._stationary and self._noise is None:
+            self._profiled += chunk.shape[0]
+            if float(np.sqrt(np.mean(chunk ** 2))) < _PROFILE_ENERGY_LIMIT:
+                self._pbuf.append(chunk.copy())
+            enough  = sum(a.shape[0] for a in self._pbuf) >= self._target
+            timeout = self._profiled >= self._target * 3
+            if enough or timeout:
+                self._noise = (np.concatenate(self._pbuf) if self._pbuf
+                               else np.zeros(self.CHUNK_SAMP, dtype=np.float32))
                 self._pbuf.clear()
-            return pcm16   # pass through while building profile
+            # Return highpass-filtered audio while profiling
+            return (np.clip(chunk, -1.0, 1.0) * 32768).astype(np.int16).tobytes()
 
-        # ── Phase 2: buffer → denoise → output ───────────────────────────────
+        # ── Phase 2: accumulate → denoise → emit ─────────────────────────────
         self._inbuf = np.concatenate([self._inbuf, chunk])
-
         if self._inbuf.shape[0] >= self.CHUNK_SAMP:
             seg         = self._inbuf[:self.CHUNK_SAMP]
             self._inbuf = self._inbuf[self.CHUNK_SAMP:]
             try:
-                clean = nr.reduce_noise(
-                    y=seg, y_noise=self._noise, sr=self._sr,
-                    stationary=True, prop_decrease=self._prop,
-                    n_fft=256, n_jobs=1,
-                )
-                self._outbuf = np.concatenate([self._outbuf, clean])
+                self._outbuf = np.concatenate([self._outbuf, self._denoise(seg)])
             except Exception:
                 self._outbuf = np.concatenate([self._outbuf, seg])
 
-        # Return one frame's worth of processed audio (~80 ms output delay)
-        n = chunk.shape[0]
-        if self._outbuf.shape[0] >= n:
-            out          = self._outbuf[:n]
-            self._outbuf = self._outbuf[n:]
-            return (np.clip(out, -1.0, 1.0) * 32768).astype(np.int16).tobytes()
-
-        return pcm16   # output buffer not yet primed — pass original through
+        return self._emit(chunk.shape[0], chunk)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -213,7 +264,7 @@ DEFAULT_CUSTOMER: dict[str, str] = {
     "emi_due_date":     os.getenv("DEFAULT_EMI_DUE_DATE",     "5 March 2026"),
     "min_partial":      os.getenv("DEFAULT_MIN_PARTIAL",      "1,500"),
     "min_partial_int":  os.getenv("DEFAULT_MIN_PARTIAL_INT",  "1500"),
-    "payment_deadline": os.getenv("DEFAULT_PAYMENT_DEADLINE", "2026-03-20"),
+    "payment_deadline": os.getenv("DEFAULT_PAYMENT_DEADLINE", ""),  # filled per-call by _build_default_ctx()
 }
 
 # Mandatory closing — used at end of C2 C3 C4 C5
@@ -516,6 +567,13 @@ def _fmt_date(d: _date) -> str:
     return d.strftime("%-d %B %Y")
 
 
+def _build_default_ctx() -> dict[str, str]:
+    ctx = dict(DEFAULT_CUSTOMER)
+    if not ctx.get("payment_deadline"):
+        ctx["payment_deadline"] = _fmt_date(_date.today() + timedelta(days=7))
+    return ctx
+
+
 _TRAILING_VERBS = re.compile(
     r"\s*(?:करना|करूंगा|करूँगा|कर दूंगा|कर दूँगा|कर दें|कर दीजिए"
     r"|हो जाएगा|हो जायेगा|बाद में|ठीक है|okay|ok)[।.,\s]*$",
@@ -528,6 +586,38 @@ def _clean_callback_time(text: str) -> str:
     return cleaned if cleaned else text[:60]
 
 
+# Bare acknowledgements that are NOT a time/date — reject these as callback times.
+_BARE_ACK = re.compile(
+    r"^(haan?|han|ha|nahi?|nai|okay?|ok|theek\s*hai|bilkul|zaroor|"
+    r"ji+|sahi\s*hai|acha|accha|"
+    r"हाँ?|हां|नहीं|नहीं|ठीक\s*है|बिल्कुल|जरूर|जी+|अच्छा|सही\s*है)[।.,!?\s]*$",
+    re.IGNORECASE | re.UNICODE,
+)
+
+# Recognisable time/date words — at least one must be present for a valid callback time.
+_TIME_WORD = re.compile(
+    r"\d"                           # any digit (3 baje, 15 tarikh …)
+    r"|kal\b|parso\b|agle\b|hafte?\b|mahine?\b|ghante?\b|baje?\b|"
+    r"shaam\b|raat\b|subah\b|dopahar\b|savere\b|"
+    r"monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
+    r"somvar|mangal|budhvar|gurvar|shukra|shanivar|ravivar|"
+    r"week|month|morning|evening|night|afternoon|hour|minute|"
+    r"कल|परसों|अगले|हफ्ते?|महीने?|घंटे?|बजे?|"
+    r"शाम|रात|सुबह|दोपहर|सवेरे|"
+    r"सोमवार|मंगलवार|बुधवार|गुरुवार|शुक्रवार|शनिवार|रविवार|"
+    r"दिन\b|सप्ताह|तारीख",
+    re.IGNORECASE | re.UNICODE,
+)
+
+
+def _is_callback_time(text: str) -> bool:
+    """Return True only if the utterance plausibly contains a time/date reference."""
+    t = text.strip()
+    if not t or bool(_BARE_ACK.match(t)):
+        return False
+    return bool(_TIME_WORD.search(t))
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Classification — rule-based primary, Sarvam-M LLM fallback
 # ─────────────────────────────────────────────────────────────────────────────
@@ -535,71 +625,169 @@ def _clean_callback_time(text: str) -> str:
 def _heuristic(utterance: str, state: str) -> str | None:
     """
     Keyword classifier. Returns a transition label or None (→ LLM fallback).
-    Only called for states that require intent classification.
+    Tuned for real Indian phone call patterns — Hindi, Hinglish, code-switching.
     """
     t = utterance.lower().strip()
     if not t or t == "[silence]":
         return "mark_unclear"
 
+    # ── WRONG NUMBER / NETWORK — catch before any intent classification ────────
+    if any(k in t for k in ["galat number", "wrong number", "kaun bol raha", "kaun hai aap",
+                              "kaun baat kar", "kise chahiye", "mera number nahi",
+                              "गलत नंबर", "कौन बोल रहा", "कौन है आप"]):
+        return "mark_unclear"
+    if any(k in t for k in ["hello hello", "sunai nahi", "awaaz nahi", "network nahi",
+                              "signal nahi", "cut ho raha", "connection nahi",
+                              "सुनाई नहीं", "आवाज़ नहीं", "नेटवर्क नहीं"]):
+        return "mark_unclear"
+
     # ── OPENING ──────────────────────────────────────────────────────────────
     if state == "opening":
-        # C1: death
+
+        # C1: Death of borrower or family member
         if any(k in t for k in ["maut", "mara", "mar gaye", "expire", "wafat",
-                                  "nahi rahe", "guzar gaye", "chale gaye", "निधन",
-                                  "मौत", "गुज़र गए", "नहीं रहे"]):
+                                  "nahi rahe", "guzar gaye", "chale gaye", "kal ho gaye",
+                                  "swarg", "diwali ho gaye", "nahi raha",
+                                  "निधन", "मौत", "गुज़र गए", "नहीं रहे", "स्वर्ग"]):
             return "goto_death"
 
-        # C6: already paid
+        # C6: Payment already made — past tense + optional payment method
         if any(k in t for k in ["kar diya", "de diya", "bhej diya", "ho gaya", "paid",
                                   "already", "pehle hi", "kar chuka", "kiya tha",
-                                  "कर दिया", "दे दिया", "भेज दिया", "हो गया", "पहले ही"]):
+                                  "transfer ho", "jama ho", "credit ho",
+                                  "receipt hai", "confirmation aaya", "sms aaya",
+                                  "neft kiya", "rtgs kiya", "imps kiya",
+                                  "phonepe kiya", "gpay kiya", "paytm kiya",
+                                  "cheque de diya", "cash de diya",
+                                  "कर दिया", "दे दिया", "भेज दिया", "हो गया", "पहले ही",
+                                  "जमा हो गया", "receipt है"]):
             return "goto_already_paid"
 
-        # C7: busy / callback
-        if any(k in t for k in ["busy", "vyast", "baad mein", "later", "call back",
-                                  "callback", "abhi time nahi", "phir karo",
-                                  "बाद में", "अभी time नहीं", "व्यस्त"]):
+        # C7: Busy right now — can't talk, will call back
+        # Check BEFORE C5 so "बात नहीं कर पाऊंगा" (can't talk) is not confused
+        # with "EMI नहीं कर पाऊंगा" (can't pay)
+        if any(k in t for k in [
+                # Explicit busy / callback
+                "busy", "vyast", "baad mein", "later", "call back", "callback",
+                "abhi time nahi", "phir karo", "wapas call", "phir call",
+                "baad mein ring", "baad mein baat", "thodi der mein call",
+                "बाद में", "अभी time नहीं", "व्यस्त", "वापस call",
+                # Outside / not home
+                "bahar", "ghar nahi", "ghar pe nahi", "ghar par nahi",
+                "बाहर", "घर नहीं", "घर पे नहीं",
+                # Can't talk / not available right now (temporal, not financial)
+                "baat nahi", "बात नहीं", "abhi baat", "अभी बात",
+                # "अभी तो नहीं" — temporal "right now at least" implies callback, not inability
+                "abhi to nahi", "abhi toh nahi", "अभी तो नहीं",
+                # In transit
+                "train mein", "train me ", "bus mein", "metro mein",
+                "flight mein", "auto mein", "cab mein", "taxi mein",
+                "ट्रेन में", "बस में", "मेट्रो में", "फ्लाइट में",
+                # In a place / activity
+                "bathroom", "washroom", "शौचालय",
+                "khaana kha", "khana kha", "kha raha", "खाना खा", "खा रहा",
+                "so raha", "neend", "सो रहा", "नींद",
+                "office mein hoon", "meeting mein", "class mein", "school mein",
+                "mandir mein", "masjid mein", "temple mein", "namaz",
+                "ऑफिस में हूँ", "मीटिंग में",
+                # Driving
+                "drive", "driving", "gadi chala", "gaadi chala", "गाड़ी चला",
+                # Time-based callback
+                "ek ghante", "do ghante", "ghante mein", "aadhe ghante",
+                "thodi der", "kuch der", "shaam ko call", "raat ko call",
+                "एक घंटे", "आधे घंटे", "थोड़ी देर"]):
             return "goto_callback"
 
-        # C2: explicit partial payment offer
-        if any(k in t for k in ["partial", "thoda", "kuch amount", "aadha", "half",
-                                  "kuch de sakta", "thodi payment",
-                                  "थोड़ा", "कुछ", "आधा"]):
+        # C2: Partial payment offer today
+        # Exclude time-context ("थोड़ा वक्त") so "give me time" doesn't hit this
+        _partial_kws = any(k in t for k in [
+                "partial", "thoda", "kuch amount", "aadha", "half",
+                "kuch de sakta", "thodi payment", "jo bhi hai de",
+                "kuch paise hain", "kuch to de",
+                "थोड़ा", "आधा", "जो भी है दे", "कुछ पैसे हैं",
+                # "half amount", "aadha amount" patterns
+                "aadha amount", "half amount", "कुछ amount"])
+        _time_context = any(k in t for k in ["वक्त", "waqt", "samay", "समय", "der"])
+        if _partial_kws and not _time_context:
             return "goto_partial"
 
-        # C3: future date promise
-        if any(k in t for k in ["tarikh", "date tak", "din mein", "hafte mein",
-                                  "next week", "kal tak", "parso tak", "is hafte",
-                                  "agle hafte", "agle mahine", "mahine mein",
-                                  "तारीख", "दिन में", "हफ़्ते में", "कल तक",
-                                  "अगले हफ़्ते", "अगले हफ्ते", "अगले महीने",
-                                  "महीने में", "महीने बाद", "महीने तक",
-                                  "हफ्ते में", "हफ्ते बाद", "हफ्ते तक"]):
+        # C3: Future payment promise — specific date, week, salary cycle
+        if any(k in t for k in [
+                # Date / time anchors
+                "tarikh", "date tak", "din mein", "hafte mein", "hafte tak",
+                "next week", "kal tak", "parso tak", "is hafte",
+                "agle hafte", "agle mahine", "mahine mein", "mahine tak",
+                # Devanagari date anchors
+                "तारीख", "दिन में", "दिन में", "हफ़्ते में", "हफ्ते में",
+                "कल तक", "परसों तक", "अगले हफ़्ते", "अगले हफ्ते",
+                "अगले महीने", "महीने में", "महीने बाद", "महीने तक",
+                "हफ्ते बाद", "हफ्ते तक",
+                # "give me time" requests
+                "वक्त दीजिए", "वक्त चाहिए", "समय दीजिए", "समय चाहिए",
+                "waqt chahiye", "waqt do", "thoda waqt",
+                # Salary / income cycle
+                "salary aate", "salary aa jaye", "salary milte", "salary ke baad",
+                "salary aayi to", "bonus aate", "payment aate",
+                "सैलरी आते", "सैलरी आए", "सैलरी के बाद",
+                # End of month / payday
+                "month end", "mahine ke end", "end of month", "pehli tarikh",
+                "1 tarikh", "1st ko", "महीने के अंत", "पहली तारीख",
+                # Weekend
+                "weekend", "sunday ko", "saturday ko", "शनिवार", "रविवार",
+                # Definite near-future
+                "pakka kal", "kal pakka", "kal zaroor", "kal pakka kar dunga",
+                "कल पक्का", "पक्का कल"]):
             return "goto_future_promise"
 
-        # C4: full payment right now / today
-        if any(k in t for k in ["aaj karunga", "aaj kar deta", "abhi karta",
-                                  "turant", "abhi pay", "immediately",
-                                  "आज करूंगा", "आज कर देता", "अभी करता"]):
+        # C4: Ready to pay right now — including asking for payment link/details
+        if any(k in t for k in [
+                "aaj karunga", "aaj kar deta", "abhi karta", "abhi online",
+                "turant", "abhi pay", "immediately", "abhi transfer",
+                "net banking se karta", "phonepe karta", "gpay karta",
+                "आज करूंगा", "आज कर देता", "अभी करता", "अभी online",
+                # Asking for payment link = intent to pay now
+                "link bhejo", "link do", "link send karo", "payment link",
+                "upi id do", "upi id bhejo", "account number do",
+                "लिंक भेजो", "लिंक दो", "UPI ID दो"]):
             return "goto_pay_now"
 
-        # C5a: financial difficulty (unable) → offer partial first
-        if any(k in t for k in ["nahi kar paunga", "nahi ho payega", "mushkil",
-                                  "problem hai", "paise nahi", "takleef", "dikkat",
-                                  "nahi kar pata", "नहीं कर पाऊंगा", "मुश्किल",
-                                  "पैसे नहीं", "तकलीफ़"]):
+        # C5a: Financial difficulty — can't pay, tight on money
+        if any(k in t for k in [
+                "nahi kar paunga", "nahi ho payega", "mushkil", "problem hai",
+                "paise nahi", "takleef", "dikkat", "nahi kar pata",
+                "nahi ho sakta", "sambhav nahi", "abhi sambhav",
+                # Money / account related
+                "account mein nahi", "account me nahi", "balance nahi",
+                "itne paise nahi", "itna nahi hai", "poora nahi hai",
+                "poora amount nahi", "pura amount nahi",
+                "salary nahi aayi", "salary pending", "salary nahi mili",
+                "pareshaan", "pareshani",
+                # Devanagari
+                "नहीं कर पाऊंगा", "मुश्किल", "पैसे नहीं", "तकलीफ़",
+                "खाते में नहीं", "बैलेंस नहीं", "सैलरी नहीं आई",
+                "परेशान", "पूरा amount नहीं", "पूरा नहीं है"]):
             return "goto_financial_difficulty"
 
-        # C5b: hard refusal (won't pay)
-        if any(k in t for k in ["nahi karunga", "nahi dunga", "band karo", "mat karo",
-                                  "mujhe matlab nahi", "nahi bhejna",
-                                  "नहीं करूंगा", "नहीं दूंगा", "बंद करो"]):
+        # C5b: Hard refusal — flat-out won't pay, legal threats, aggressive
+        if any(k in t for k in [
+                "nahi karunga", "nahi dunga", "band karo", "mat karo",
+                "mujhe matlab nahi", "nahi bhejna", "matlab nahi",
+                "nahi karna hai", "nahi karna", "nahi dena",
+                "legal notice", "legal action", "court mein", "court le jao",
+                "karo jo karna hai", "jo karna ho karo", "notice bhejo",
+                "mujhe koi dar nahi", "koi farq nahi", "harassment",
+                "complaint karunga", "consumer court",
+                "नहीं करूंगा", "नहीं दूंगा", "बंद करो", "मतलब नहीं",
+                "नहीं करना है", "कोर्ट में", "जो करना हो करो",
+                "शिकायत करूंगा", "कोई डर नहीं"]):
             return "goto_refusal"
 
         # Generic yes → full payment
         if any(k in t for k in ["haan", "han", "ha ", "bilkul", "zaroor",
                                   "theek hai", "okay", "ok", "karunga", "kar dunga",
-                                  "हाँ", "हां", "बिल्कुल", "ठीक है", "करूंगा"]):
+                                  "ji ji", "ji haan", "ji han", "haanji", "hanji", "acha",
+                                  "हाँ", "हां", "बिल्कुल", "ठीक है", "करूंगा",
+                                  "जी जी", "जी हाँ", "हाँ जी", "हांजी", "अच्छा"]):
             return "goto_pay_now"
 
         # Bare नहीं / nahi → financial difficulty (benefit of doubt)
@@ -610,21 +798,33 @@ def _heuristic(utterance: str, state: str) -> str | None:
 
     # ── OFFER PARTIAL (after financial difficulty) ────────────────────────────
     elif state == "offer_partial":
+        # Callback / busy first — don't push payment on someone who can't talk
+        if any(k in t for k in ["baad mein", "later", "bahar", "kal", "abhi nahi",
+                                  "train", "bus mein", "drive", "bathroom", "office",
+                                  "बाद में", "बाहर", "कल", "अभी नहीं",
+                                  "baat karunga", "baat karenge", "phir baat",
+                                  "बात करूंगा", "बात करेंगे", "फिर बात"]):
+            return "goto_callback"
         if any(k in t for k in ["haan", "han", "bilkul", "theek hai", "okay", "karunga",
-                                  "partial", "de sakta", "kar sakta", "हाँ", "ठीक है"]):
+                                  "partial", "de sakta", "kar sakta", "deta hoon",
+                                  "jo bhi hai", "kuch deta", "हाँ", "ठीक है", "दे सकता",
+                                  # Respectful yes forms common in Indian calls
+                                  "ji ji", "ji haan", "ji han", "haanji", "hanji", "acha",
+                                  "जी जी", "जी हाँ", "हाँ जी", "हांजी", "अच्छा"]):
             return "goto_partial_yes"
-        return "goto_partial_no"   # any other response = decline
+        return "goto_partial_no"
 
     # ── REFUSAL: ask reason / escalate ───────────────────────────────────────
     elif state in ("refusal_ask_reason", "refusal_escalate"):
-        # Clear continued refusal (won't give a reason)
+        # Clear dismissal — won't give a reason
         if any(k in t for k in ["nahi bataunga", "chodo", "band karo", "mat karo",
                                   "koi reason nahi", "nahi bolunga", "nahi chahiye",
-                                  "नहीं बताऊंगा", "छोड़ो", "बंद करो"]):
+                                  "pata nahi", "kuch nahi", "bas nahi",
+                                  "नहीं बताऊंगा", "छोड़ो", "बंद करो", "पता नहीं"]):
             return "still_refusing"
-        # Any other substantive reply = reason given
-        words = [w for w in t.split() if w.strip(".,?!।")]
-        if len(words) >= 2:
+        # Substantive reply (3+ real words) = reason given
+        words = [w for w in t.split() if len(w.strip(".,?!।")) > 1]
+        if len(words) >= 3:
             return "got_reason"
         return "still_refusing"
 
@@ -652,12 +852,12 @@ MARK_UNCLEAR              — completely unintelligible
 When between FINANCIAL_DIFFICULTY and REFUSAL, prefer FINANCIAL_DIFFICULTY.""",
 
     "offer_partial": """\
-The agent offered: "Kya aap partial payment kar sakte hain?"
-The customer said: "{utterance}"
+The agent offered partial payment. The customer said: "{utterance}"
 
 Output EXACTLY ONE:
 GOTO_PARTIAL_YES — accepts partial payment offer
-GOTO_PARTIAL_NO  — declines""",
+GOTO_CALLBACK    — busy, outside, wants to be called back later
+GOTO_PARTIAL_NO  — declines for any other reason""",
 
     "refusal_ask_reason": """\
 The agent asked: "Aap payment kyun nahi kar pa rahe?"
@@ -846,7 +1046,8 @@ class CallSession:
     call_sid:         str  = ""
     state:            str  = "opening"
     done:             bool = False
-    speaking:         bool = False
+    speaking:         bool  = False
+    tts_started_at:   float = 0.0  # monotonic time when current TTS play started
     unclear_count:    int  = 0
     marks_out:        int  = 0
     last_queued:      str  = ""
@@ -887,9 +1088,11 @@ async def make_call(
     to   = (body.get("to") or "").strip()
     if not to:
         raise HTTPException(status_code=422, detail="`to` (phone number) is required")
-    ctx  = {**DEFAULT_CUSTOMER, **{k: str(v) for k, v in body.items() if k != "to"}}
-    call = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN).calls.create(
-        url=f"{NGROK_URL}/outgoing-call", to=to, from_=TWILIO_PHONE_NUMBER,
+    ctx  = {**_build_default_ctx(), **{k: str(v) for k, v in body.items() if k != "to"}}
+    call = await asyncio.to_thread(
+        lambda: TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN).calls.create(
+            url=f"{NGROK_URL}/outgoing-call", to=to, from_=TWILIO_PHONE_NUMBER,
+        )
     )
     _pending_ctx[call.sid] = ctx
     log.info("Outbound call initiated — SID=%s to=%s", call.sid, to)
@@ -914,7 +1117,7 @@ async def media_stream(twilio_ws: WebSocket) -> None:
     await twilio_ws.accept()
     log.info("Twilio media stream connected")
 
-    sess  = CallSession(ctx=dict(DEFAULT_CUSTOMER))
+    sess  = CallSession(ctx=_build_default_ctx())
     abort = [False]
     utt_q: asyncio.Queue[str] = asyncio.Queue()
     drained = asyncio.Event()
@@ -922,7 +1125,11 @@ async def media_stream(twilio_ws: WebSocket) -> None:
 
     # Per-call spectral denoiser (CPU-bound → runs in thread pool)
     _denoiser  = (
-        _StreamDenoiser(prop_decrease=DENOISE_STRENGTH, profile_sec=DENOISE_PROFILE_SEC)
+        _StreamDenoiser(
+            prop_decrease=DENOISE_STRENGTH,
+            profile_sec=DENOISE_PROFILE_SEC,
+            stationary=DENOISE_STATIONARY,
+        )
         if DENOISE_ENABLED else None
     )
     _denoise_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
@@ -1001,6 +1208,7 @@ async def media_stream(twilio_ws: WebSocket) -> None:
                 return
             t0 = time.perf_counter()
             abort[0] = False
+            sess.tts_started_at = time.monotonic()
             sess.speaking = True
             try:
                 ok = await tts_stream(text, push, abort)
@@ -1047,8 +1255,11 @@ async def media_stream(twilio_ws: WebSocket) -> None:
             await asyncio.sleep(HANGUP_GRACE_SEC)
             if sess.call_sid:
                 try:
-                    TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)\
-                        .calls(sess.call_sid).update(status="completed")
+                    _sid = sess.call_sid
+                    await asyncio.to_thread(
+                        lambda: TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+                                .calls(_sid).update(status="completed")
+                    )
                     log.info("Call %s terminated", sess.call_sid)
                 except Exception as exc:
                     log.error("Twilio hangup error: %s", exc)
@@ -1163,8 +1374,14 @@ async def media_stream(twilio_ws: WebSocket) -> None:
                     if msg_type == "events":
                         signal = str(inner.get("signal_type", "")).upper()
                         if signal == "START_SPEECH" and sess.speaking:
-                            log.info("Barge-in detected — aborting TTS")
-                            abort[0] = True
+                            _guard_elapsed = time.monotonic() - sess.tts_started_at
+                            if sess.state in _TERMINAL:
+                                log.debug("Barge-in suppressed (terminal state)")
+                            elif _guard_elapsed < BARGE_IN_GUARD_SEC:
+                                log.debug("Barge-in suppressed (guard %.0f ms)", _guard_elapsed * 1000)
+                            else:
+                                log.info("Barge-in detected — aborting TTS")
+                                abort[0] = True
                         elif signal == "END_SPEECH":
                             pending = sess.last_interim.strip()
                             if pending and not sess.done and pending != sess.last_queued:
@@ -1200,8 +1417,14 @@ async def media_stream(twilio_ws: WebSocket) -> None:
                         if sess.done or transcript == sess.last_queued:
                             continue
                         if sess.speaking:
-                            abort[0] = True
-                            log.info("Barge-in utterance: %s", transcript)
+                            _guard_elapsed = time.monotonic() - sess.tts_started_at
+                            if sess.state in _TERMINAL:
+                                log.debug("Barge-in suppressed (terminal state): %s", transcript)
+                            elif _guard_elapsed < BARGE_IN_GUARD_SEC:
+                                log.debug("Barge-in suppressed (guard %.0f ms): %s", _guard_elapsed * 1000, transcript)
+                            else:
+                                abort[0] = True
+                                log.info("Barge-in utterance: %s", transcript)
                         log.info("[USER] %s", transcript)
                         sess.last_queued  = transcript
                         sess.last_interim = ""
@@ -1336,6 +1559,14 @@ async def media_stream(twilio_ws: WebSocket) -> None:
 
                     if action == "goto_partial_yes":
                         await go("partial_ask_amount")
+                    elif action == "goto_callback":
+                        d = _parse_date(utterance)
+                        _today = _date.today()
+                        if d and d >= _today:
+                            sess.ctx["callback_time"] = _fmt_date(d)
+                            await go("callback_confirm")
+                            break
+                        await go("callback_ask_time")
                     else:
                         # declined partial → refusal flow
                         await go("refusal_ask_reason")
@@ -1451,14 +1682,14 @@ async def media_stream(twilio_ws: WebSocket) -> None:
 
                 # ── C5: credit warning + ask callback time ────────────────────
                 elif sess.state == "refusal_credit_warn":
-                    # Any response is treated as callback preference
                     d = _parse_date(utterance)
                     if d and d >= _date.today():
                         sess.ctx["callback_time"] = _fmt_date(d)
-                    elif utterance and utterance != "[silence]":
+                    elif _is_callback_time(utterance):
                         sess.ctx["callback_time"] = _clean_callback_time(utterance)
                     else:
-                        sess.ctx.setdefault("callback_time", "जल्द ही")
+                        # Bare ack / silence — default, don't store "हाँ" verbatim
+                        sess.ctx["callback_time"] = "जल्द ही"
                     await go("refusal_close")
                     break
 
@@ -1510,10 +1741,11 @@ async def media_stream(twilio_ws: WebSocket) -> None:
                     if d and d >= today:
                         sess.ctx["callback_time"] = _fmt_date(d)
                         sess.date_retries = 0
-                    elif utterance and utterance != "[silence]":
+                    elif _is_callback_time(utterance):
                         sess.ctx["callback_time"] = _clean_callback_time(utterance)
                         sess.date_retries = 0
                     else:
+                        # No recognisable time — retry once, then default
                         sess.date_retries += 1
                         if sess.date_retries >= 2:
                             sess.ctx["callback_time"] = "जल्द ही"
@@ -1574,7 +1806,7 @@ if __name__ == "__main__":
     def _dial() -> None:
         time.sleep(2)
         try:
-            _place_call(to, dict(DEFAULT_CUSTOMER))
+            _place_call(to, _build_default_ctx())
         except Exception as exc:
             log.error("Dial error: %s", exc)
 
