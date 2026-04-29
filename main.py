@@ -84,7 +84,8 @@ SARVAM_STT_WS_BASE  = os.getenv("SARVAM_STT_WS_BASE",  "wss://api.sarvam.ai/spee
 SARVAM_STT_MODEL    = os.getenv("SARVAM_STT_MODEL",    "saaras:v3")
 SARVAM_STT_LANGUAGE = os.getenv("SARVAM_STT_LANGUAGE", "hi-IN")
 SARVAM_LLM_BASE_URL = os.getenv("SARVAM_LLM_BASE_URL", "https://api.sarvam.ai/v1")
-LLM_MODEL           = os.getenv("SARVAM_LLM_MODEL",    "sarvam-105b")
+LLM_MODEL           = os.getenv("LLM_MODEL",           "gpt-4.1-mini")
+OPENAI_API_KEY      = os.getenv("OPENAI_API_KEY",      "")
 SARVAM_VOICE        = os.getenv("SARVAM_VOICE",        "simran")
 PORT                = int(os.getenv("PORT",             "5050"))
 TRANSCRIPTS_DIR     = os.getenv("TRANSCRIPTS_DIR",     "transcripts")
@@ -248,7 +249,8 @@ _http = httpx.AsyncClient(
     timeout=httpx.Timeout(connect=4.0, read=15.0, write=5.0, pool=5.0),
     limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
 )
-_oai = AsyncOpenAI(api_key=SARVAM_API_KEY, base_url=SARVAM_LLM_BASE_URL)
+_oai     = AsyncOpenAI(api_key=SARVAM_API_KEY, base_url=SARVAM_LLM_BASE_URL)  # Sarvam (STT/TTS auth, unused for LLM now)
+_oai_llm = AsyncOpenAI(api_key=OPENAI_API_KEY)                                # OpenAI GPT-4.1-mini for classification
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -361,8 +363,10 @@ _SCRIPTS: dict[str, str] = {
         "आप चाहेंगे कि हम आपसे दोबारा कब संपर्क करें?"
     ),
     "refusal_close": (
-        "ठीक है, हम आपसे {callback_time} पर संपर्क करेंगे। "
-        + _MANDATORY_CLOSING
+        "ठीक है, हम आपसे {callback_time} संपर्क करेंगे। "
+        "कृपया {payment_deadline} तक भुगतान करने की कोशिश करें — "
+        "इससे आपका CIBIL स्कोर सुरक्षित रहेगा। "
+        "आपका दिन शुभ हो।"
     ),
 
     # ── C6: Already paid ──────────────────────────────────────────────────────
@@ -394,7 +398,7 @@ _SCRIPTS: dict[str, str] = {
         "समय समझ नहीं आया। कृपया फिर से बताइए, जैसे 'कल दोपहर' या 'तीन बजे'।"
     ),
     "callback_confirm": (
-        "ठीक है, हम आपसे {callback_time} पर संपर्क करेंगे। "
+        "ठीक है, हम आपसे {callback_time} संपर्क करेंगे। "
         "कृपया कोशिश करें कि EMI जल्दी चुका दें ताकि जुर्माना न लगे।"
     ),
 
@@ -575,7 +579,8 @@ def _build_default_ctx() -> dict[str, str]:
 
 
 _TRAILING_VERBS = re.compile(
-    r"\s*(?:करना|करूंगा|करूँगा|कर दूंगा|कर दूँगा|कर दें|कर दीजिए"
+    r"\s*(?:करना|करूंगा|करूँगा|कर दूंगा|कर दूँगा|कर दें|कर दीजिए|कर दीजिएगा"
+    r"|कीजिएगा|कीजिए|करिएगा|करिए|कर लीजिए|कर लीजिएगा"
     r"|हो जाएगा|हो जायेगा|बाद में|ठीक है|okay|ok)[।.,\s]*$",
     re.IGNORECASE,
 )
@@ -619,237 +624,35 @@ def _is_callback_time(text: str) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Classification — rule-based primary, Sarvam-M LLM fallback
+# Classification — pure LLM (GPT-4.1-mini)
 # ─────────────────────────────────────────────────────────────────────────────
-
-def _heuristic(utterance: str, state: str) -> str | None:
-    """
-    Keyword classifier. Returns a transition label or None (→ LLM fallback).
-    Tuned for real Indian phone call patterns — Hindi, Hinglish, code-switching.
-    """
-    t = utterance.lower().strip()
-    if not t or t == "[silence]":
-        return "mark_unclear"
-
-    # ── WRONG NUMBER / NETWORK — catch before any intent classification ────────
-    if any(k in t for k in ["galat number", "wrong number", "kaun bol raha", "kaun hai aap",
-                              "kaun baat kar", "kise chahiye", "mera number nahi",
-                              "गलत नंबर", "कौन बोल रहा", "कौन है आप"]):
-        return "mark_unclear"
-    if any(k in t for k in ["hello hello", "sunai nahi", "awaaz nahi", "network nahi",
-                              "signal nahi", "cut ho raha", "connection nahi",
-                              "सुनाई नहीं", "आवाज़ नहीं", "नेटवर्क नहीं"]):
-        return "mark_unclear"
-
-    # ── OPENING ──────────────────────────────────────────────────────────────
-    if state == "opening":
-
-        # C1: Death of borrower or family member
-        if any(k in t for k in ["maut", "mara", "mar gaye", "expire", "wafat",
-                                  "nahi rahe", "guzar gaye", "chale gaye", "kal ho gaye",
-                                  "swarg", "diwali ho gaye", "nahi raha",
-                                  "निधन", "मौत", "गुज़र गए", "नहीं रहे", "स्वर्ग"]):
-            return "goto_death"
-
-        # C6: Payment already made — past tense + optional payment method
-        if any(k in t for k in ["kar diya", "de diya", "bhej diya", "ho gaya", "paid",
-                                  "already", "pehle hi", "kar chuka", "kiya tha",
-                                  "transfer ho", "jama ho", "credit ho",
-                                  "receipt hai", "confirmation aaya", "sms aaya",
-                                  "neft kiya", "rtgs kiya", "imps kiya",
-                                  "phonepe kiya", "gpay kiya", "paytm kiya",
-                                  "cheque de diya", "cash de diya",
-                                  "कर दिया", "दे दिया", "भेज दिया", "हो गया", "पहले ही",
-                                  "जमा हो गया", "receipt है"]):
-            return "goto_already_paid"
-
-        # C7: Busy right now — can't talk, will call back
-        # Check BEFORE C5 so "बात नहीं कर पाऊंगा" (can't talk) is not confused
-        # with "EMI नहीं कर पाऊंगा" (can't pay)
-        if any(k in t for k in [
-                # Explicit busy / callback
-                "busy", "vyast", "baad mein", "later", "call back", "callback",
-                "abhi time nahi", "phir karo", "wapas call", "phir call",
-                "baad mein ring", "baad mein baat", "thodi der mein call",
-                "बाद में", "अभी time नहीं", "व्यस्त", "वापस call",
-                # Outside / not home
-                "bahar", "ghar nahi", "ghar pe nahi", "ghar par nahi",
-                "बाहर", "घर नहीं", "घर पे नहीं",
-                # Can't talk / not available right now (temporal, not financial)
-                "baat nahi", "बात नहीं", "abhi baat", "अभी बात",
-                # "अभी तो नहीं" — temporal "right now at least" implies callback, not inability
-                "abhi to nahi", "abhi toh nahi", "अभी तो नहीं",
-                # In transit
-                "train mein", "train me ", "bus mein", "metro mein",
-                "flight mein", "auto mein", "cab mein", "taxi mein",
-                "ट्रेन में", "बस में", "मेट्रो में", "फ्लाइट में",
-                # In a place / activity
-                "bathroom", "washroom", "शौचालय",
-                "khaana kha", "khana kha", "kha raha", "खाना खा", "खा रहा",
-                "so raha", "neend", "सो रहा", "नींद",
-                "office mein hoon", "meeting mein", "class mein", "school mein",
-                "mandir mein", "masjid mein", "temple mein", "namaz",
-                "ऑफिस में हूँ", "मीटिंग में",
-                # Driving
-                "drive", "driving", "gadi chala", "gaadi chala", "गाड़ी चला",
-                # Time-based callback
-                "ek ghante", "do ghante", "ghante mein", "aadhe ghante",
-                "thodi der", "kuch der", "shaam ko call", "raat ko call",
-                "एक घंटे", "आधे घंटे", "थोड़ी देर"]):
-            return "goto_callback"
-
-        # C2: Partial payment offer today
-        # Exclude time-context ("थोड़ा वक्त") so "give me time" doesn't hit this
-        _partial_kws = any(k in t for k in [
-                "partial", "thoda", "kuch amount", "aadha", "half",
-                "kuch de sakta", "thodi payment", "jo bhi hai de",
-                "kuch paise hain", "kuch to de",
-                "थोड़ा", "आधा", "जो भी है दे", "कुछ पैसे हैं",
-                # "half amount", "aadha amount" patterns
-                "aadha amount", "half amount", "कुछ amount"])
-        _time_context = any(k in t for k in ["वक्त", "waqt", "samay", "समय", "der"])
-        if _partial_kws and not _time_context:
-            return "goto_partial"
-
-        # C3: Future payment promise — specific date, week, salary cycle
-        if any(k in t for k in [
-                # Date / time anchors
-                "tarikh", "date tak", "din mein", "hafte mein", "hafte tak",
-                "next week", "kal tak", "parso tak", "is hafte",
-                "agle hafte", "agle mahine", "mahine mein", "mahine tak",
-                # Devanagari date anchors
-                "तारीख", "दिन में", "दिन में", "हफ़्ते में", "हफ्ते में",
-                "कल तक", "परसों तक", "अगले हफ़्ते", "अगले हफ्ते",
-                "अगले महीने", "महीने में", "महीने बाद", "महीने तक",
-                "हफ्ते बाद", "हफ्ते तक",
-                # "give me time" requests
-                "वक्त दीजिए", "वक्त चाहिए", "समय दीजिए", "समय चाहिए",
-                "waqt chahiye", "waqt do", "thoda waqt",
-                # Salary / income cycle
-                "salary aate", "salary aa jaye", "salary milte", "salary ke baad",
-                "salary aayi to", "bonus aate", "payment aate",
-                "सैलरी आते", "सैलरी आए", "सैलरी के बाद",
-                # End of month / payday
-                "month end", "mahine ke end", "end of month", "pehli tarikh",
-                "1 tarikh", "1st ko", "महीने के अंत", "पहली तारीख",
-                # Weekend
-                "weekend", "sunday ko", "saturday ko", "शनिवार", "रविवार",
-                # Definite near-future
-                "pakka kal", "kal pakka", "kal zaroor", "kal pakka kar dunga",
-                "कल पक्का", "पक्का कल"]):
-            return "goto_future_promise"
-
-        # C4: Ready to pay right now — including asking for payment link/details
-        if any(k in t for k in [
-                "aaj karunga", "aaj kar deta", "abhi karta", "abhi online",
-                "turant", "abhi pay", "immediately", "abhi transfer",
-                "net banking se karta", "phonepe karta", "gpay karta",
-                "आज करूंगा", "आज कर देता", "अभी करता", "अभी online",
-                # Asking for payment link = intent to pay now
-                "link bhejo", "link do", "link send karo", "payment link",
-                "upi id do", "upi id bhejo", "account number do",
-                "लिंक भेजो", "लिंक दो", "UPI ID दो"]):
-            return "goto_pay_now"
-
-        # C5a: Financial difficulty — can't pay, tight on money
-        if any(k in t for k in [
-                "nahi kar paunga", "nahi ho payega", "mushkil", "problem hai",
-                "paise nahi", "takleef", "dikkat", "nahi kar pata",
-                "nahi ho sakta", "sambhav nahi", "abhi sambhav",
-                # Money / account related
-                "account mein nahi", "account me nahi", "balance nahi",
-                "itne paise nahi", "itna nahi hai", "poora nahi hai",
-                "poora amount nahi", "pura amount nahi",
-                "salary nahi aayi", "salary pending", "salary nahi mili",
-                "pareshaan", "pareshani",
-                # Devanagari
-                "नहीं कर पाऊंगा", "मुश्किल", "पैसे नहीं", "तकलीफ़",
-                "खाते में नहीं", "बैलेंस नहीं", "सैलरी नहीं आई",
-                "परेशान", "पूरा amount नहीं", "पूरा नहीं है"]):
-            return "goto_financial_difficulty"
-
-        # C5b: Hard refusal — flat-out won't pay, legal threats, aggressive
-        if any(k in t for k in [
-                "nahi karunga", "nahi dunga", "band karo", "mat karo",
-                "mujhe matlab nahi", "nahi bhejna", "matlab nahi",
-                "nahi karna hai", "nahi karna", "nahi dena",
-                "legal notice", "legal action", "court mein", "court le jao",
-                "karo jo karna hai", "jo karna ho karo", "notice bhejo",
-                "mujhe koi dar nahi", "koi farq nahi", "harassment",
-                "complaint karunga", "consumer court",
-                "नहीं करूंगा", "नहीं दूंगा", "बंद करो", "मतलब नहीं",
-                "नहीं करना है", "कोर्ट में", "जो करना हो करो",
-                "शिकायत करूंगा", "कोई डर नहीं"]):
-            return "goto_refusal"
-
-        # Generic yes → full payment
-        if any(k in t for k in ["haan", "han", "ha ", "bilkul", "zaroor",
-                                  "theek hai", "okay", "ok", "karunga", "kar dunga",
-                                  "ji ji", "ji haan", "ji han", "haanji", "hanji", "acha",
-                                  "हाँ", "हां", "बिल्कुल", "ठीक है", "करूंगा",
-                                  "जी जी", "जी हाँ", "हाँ जी", "हांजी", "अच्छा"]):
-            return "goto_pay_now"
-
-        # Bare नहीं / nahi → financial difficulty (benefit of doubt)
-        if "nahi" in t or "नहीं" in t:
-            return "goto_financial_difficulty"
-
-        return None  # ambiguous → LLM
-
-    # ── OFFER PARTIAL (after financial difficulty) ────────────────────────────
-    elif state == "offer_partial":
-        # Callback / busy first — don't push payment on someone who can't talk
-        if any(k in t for k in ["baad mein", "later", "bahar", "kal", "abhi nahi",
-                                  "train", "bus mein", "drive", "bathroom", "office",
-                                  "बाद में", "बाहर", "कल", "अभी नहीं",
-                                  "baat karunga", "baat karenge", "phir baat",
-                                  "बात करूंगा", "बात करेंगे", "फिर बात"]):
-            return "goto_callback"
-        if any(k in t for k in ["haan", "han", "bilkul", "theek hai", "okay", "karunga",
-                                  "partial", "de sakta", "kar sakta", "deta hoon",
-                                  "jo bhi hai", "kuch deta", "हाँ", "ठीक है", "दे सकता",
-                                  # Respectful yes forms common in Indian calls
-                                  "ji ji", "ji haan", "ji han", "haanji", "hanji", "acha",
-                                  "जी जी", "जी हाँ", "हाँ जी", "हांजी", "अच्छा"]):
-            return "goto_partial_yes"
-        return "goto_partial_no"
-
-    # ── REFUSAL: ask reason / escalate ───────────────────────────────────────
-    elif state in ("refusal_ask_reason", "refusal_escalate"):
-        # Clear dismissal — won't give a reason
-        if any(k in t for k in ["nahi bataunga", "chodo", "band karo", "mat karo",
-                                  "koi reason nahi", "nahi bolunga", "nahi chahiye",
-                                  "pata nahi", "kuch nahi", "bas nahi",
-                                  "नहीं बताऊंगा", "छोड़ो", "बंद करो", "पता नहीं"]):
-            return "still_refusing"
-        # Substantive reply (3+ real words) = reason given
-        words = [w for w in t.split() if len(w.strip(".,?!।")) > 1]
-        if len(words) >= 3:
-            return "got_reason"
-        return "still_refusing"
-
-    return None
 
 
 _LLM_CLASSIFY_PROMPTS: dict[str, str] = {
     "opening": """\
-You are classifying a Hindi/Hinglish customer response in an EMI collection call.
+Classify a Hindi/Hinglish customer reply in an EMI collection call.
+Agent asked: "Aapka EMI pending hai, kab tak kar paayenge?"
+Customer said: "{utterance}"
 
-The agent asked: "Aapka EMI pending hai, kab tak kar paayenge?"
-The customer said: "{utterance}"
+LABEL DEFINITIONS — read carefully before choosing:
+GOTO_PAY_NOW              — agrees/consents without mentioning a future date ("हाँ", "okay", "करूंगा", "ठीक है", "हाँ हाँ", "bilkul", "ji" alone)
+GOTO_PARTIAL              — explicitly offers to pay only part of the amount today
+GOTO_FUTURE_PROMISE       — names a specific future time ("kal", "agle hafte", "10 tarikh", "salary ke baad", "thoda waqt do", "kuch din de do")
+GOTO_ALREADY_PAID         — claims payment was already made
+GOTO_CALLBACK             — busy RIGHT NOW, cannot talk, asks to call back ("busy", "baad mein", "bahar hoon", "abhi time nahi", "driving", "abhi nahi kar paunga" = temporal not financial)
+GOTO_DEATH                — death of borrower or close family member
+GOTO_FINANCIAL_DIFFICULTY — financially unable to pay ("paise nahi", "mushkil hai", bare "nahi" with no other context)
+GOTO_REFUSAL              — aggressive flat refusal ("nahi dunga", "band karo", "court mein jao", explicit threats)
+MARK_UNCLEAR              — completely unintelligible noise
 
-Choose EXACTLY ONE label (output only the label):
-GOTO_PAY_NOW              — agrees to pay today or immediately
-GOTO_PARTIAL              — offers partial payment explicitly
-GOTO_FUTURE_PROMISE       — agrees to pay on a specific future date
-GOTO_ALREADY_PAID         — says payment is already done
-GOTO_CALLBACK             — busy, wants a callback later
-GOTO_DEATH                — mentions death of borrower or family member
-GOTO_FINANCIAL_DIFFICULTY — unable to pay, financial difficulty, needs time
-GOTO_REFUSAL              — flat-out refuses, no reason given
-MARK_UNCLEAR              — completely unintelligible
+KEY DISAMBIGUATION RULES:
+- "करूंगा" / "kar dunga" alone (no date) = GOTO_PAY_NOW, NOT future_promise
+- "थोड़ा वक्त दीजिए" / "kuch din do" = GOTO_FUTURE_PROMISE (asking for time, not inability)
+- "अभी time नहीं" / "अभी नहीं कर पाऊंगा" = GOTO_CALLBACK (temporal — busy now, not broke)
+- Bare "नहीं" with no aggression = GOTO_FINANCIAL_DIFFICULTY (benefit of doubt, not refusal)
+- GOTO_REFUSAL only for explicit aggression / legal threats / "nahi dunga" with finality
 
-When between FINANCIAL_DIFFICULTY and REFUSAL, prefer FINANCIAL_DIFFICULTY.""",
+Output ONLY the label, nothing else.""",
 
     "offer_partial": """\
 The agent offered partial payment. The customer said: "{utterance}"
@@ -894,25 +697,20 @@ _LLM_KEYWORD_MAP: dict[str, str] = {
 
 
 async def classify(utterance: str, state: str) -> str:
-    """Rule-based first; Sarvam-M LLM fallback for ambiguous input."""
-    result = _heuristic(utterance, state)
-    if result is not None:
-        log.info("CLASSIFY[rule] %s → %s | %r", state, result, utterance[:60])
-        return result
-
+    """GPT-4.1-mini primary classifier. Keyword heuristic kept but not used."""
     prompt_template = _LLM_CLASSIFY_PROMPTS.get(state)
     if not prompt_template:
+        log.info("CLASSIFY[no-prompt] %s → mark_unclear", state)
         return "mark_unclear"
 
     try:
-        resp = await _oai.chat.completions.create(
+        resp = await _oai_llm.chat.completions.create(
             model=LLM_MODEL,
             messages=[{"role": "user", "content": prompt_template.format(utterance=utterance)}],
             temperature=0,
-            max_tokens=512,
+            max_tokens=32,
         )
-        raw_full = (resp.choices[0].message.content or "").strip()
-        raw = re.sub(r"<think>.*?</think>", "", raw_full, flags=re.DOTALL | re.IGNORECASE).strip().upper()
+        raw = (resp.choices[0].message.content or "").strip().upper()
         log.info("CLASSIFY[llm] raw=%r", raw[:100])
         for kw in sorted(_LLM_KEYWORD_MAP, key=len, reverse=True):
             if kw in raw:
@@ -924,6 +722,61 @@ async def classify(utterance: str, state: str) -> str:
 
     log.info("CLASSIFY[default] %s → mark_unclear", state)
     return "mark_unclear"
+
+
+async def llm_extract_amount(utterance: str) -> int | None:
+    """
+    LLM fallback for amount extraction — catches Hindi word-numerals that
+    regex misses ("teen hazaar", "paanch sau", "do lakh", etc.).
+    """
+    try:
+        resp = await _oai_llm.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[{"role": "user", "content": (
+                "Extract the rupee amount (integer) from this Hindi/Hinglish text.\n"
+                "Examples: 'teen hazaar' → 3000, 'paanch sau' → 500, '₹4,500' → 4500\n"
+                "Return ONLY the integer. If no amount present, write: NONE\n\n"
+                f"Text: {utterance}\nAmount:"
+            )}],
+            temperature=0,
+            max_tokens=15,
+        )
+        r = (resp.choices[0].message.content or "").strip()
+        if not r or "NONE" in r.upper():
+            return None
+        m = re.search(r"\d+", r.replace(",", ""))
+        result = int(m.group()) if m else None
+        log.info("LLM_AMOUNT %r → %s", utterance[:50], result)
+        return result
+    except Exception as exc:
+        log.warning("llm_extract_amount error: %s", exc)
+        return None
+
+
+async def extract_callback_time(utterance: str) -> str:
+    """
+    Use LLM to pull a clean, speakable callback-time phrase from the user's utterance.
+    Falls back to _clean_callback_time() on any error.
+    """
+    try:
+        resp = await _oai_llm.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[{"role": "user", "content": (
+                "Extract ONLY the callback time/day from this Hindi/Hinglish text as a short phrase.\n"
+                "Good examples: 'आज रात 9 बजे', 'कल शाम 5 बजे', 'शनिवार को', 'अगले हफ्ते', 'कल'\n"
+                "Do NOT include verbs like 'call karo', 'sampark karo', 'kijiye', 'dijiye' etc.\n"
+                "Output ONLY the time phrase, nothing else. If completely unclear write: जल्द ही\n\n"
+                f"Text: {utterance}\nTime phrase:"
+            )}],
+            temperature=0,
+            max_tokens=25,
+        )
+        result = (resp.choices[0].message.content or "").strip().strip('।.,\'"')
+        log.info("EXTRACT_TIME[llm] %r → %r", utterance[:60], result)
+        return result if result else "जल्द ही"
+    except Exception as exc:
+        log.warning("extract_callback_time LLM error: %s", exc)
+        return _clean_callback_time(utterance)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1058,6 +911,7 @@ class CallSession:
     date_retries:     int  = 0   # retries in date-capture states
     refusal_attempts: int  = 0   # escalation counter in refusal flow
     partial_offered:  bool = False  # ensure partial offered only once
+    barge_in_active:  bool = False  # True while collecting post-barge-in utterance
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1119,6 +973,7 @@ async def media_stream(twilio_ws: WebSocket) -> None:
 
     sess  = CallSession(ctx=_build_default_ctx())
     abort = [False]
+    _fallback_task: list[asyncio.Task | None] = [None]
     utt_q: asyncio.Queue[str] = asyncio.Queue()
     drained = asyncio.Event()
     drained.set()
@@ -1201,6 +1056,40 @@ async def media_stream(twilio_ws: WebSocket) -> None:
             except Exception:
                 pass
 
+        async def send_clear() -> None:
+            """Flush Twilio's playback buffer — stops the user hearing TTS tail after barge-in."""
+            if sess.done or not sess.stream_sid:
+                return
+            try:
+                await twilio_ws.send_json({
+                    "event": "clear",
+                    "streamSid": sess.stream_sid,
+                })
+                sess.marks_out = 0
+                drained.set()
+            except Exception:
+                pass
+
+        def _cancel_fallback() -> None:
+            t = _fallback_task[0]
+            if t and not t.done():
+                t.cancel()
+            _fallback_task[0] = None
+
+        async def _queue_after_silence(text: str) -> None:
+            """1.5 s silence timer — primary utterance trigger (END_SPEECH is unreliable)."""
+            try:
+                await asyncio.sleep(POST_UTTERANCE_PAUSE_SEC)
+            except asyncio.CancelledError:
+                return
+            sess.barge_in_active = False
+            if text and not sess.done and text != sess.last_queued:
+                log.info("[USER] %s", text)
+                sess.last_queued  = text
+                sess.last_interim = ""
+                record("user", text=text)
+                await utt_q.put(text)
+
         # ── TTS ───────────────────────────────────────────────────────────────
         async def play_tts(text: str) -> None:
             text = text.strip()
@@ -1208,6 +1097,7 @@ async def media_stream(twilio_ws: WebSocket) -> None:
                 return
             t0 = time.perf_counter()
             abort[0] = False
+            sess.barge_in_active = False  # reset before each new TTS play
             sess.tts_started_at = time.monotonic()
             sess.speaking = True
             try:
@@ -1382,13 +1272,17 @@ async def media_stream(twilio_ws: WebSocket) -> None:
                             else:
                                 log.info("Barge-in detected — aborting TTS")
                                 abort[0] = True
+                                sess.barge_in_active = True
+                                await send_clear()
                         elif signal == "END_SPEECH":
+                            _cancel_fallback()
+                            sess.barge_in_active = False
                             pending = sess.last_interim.strip()
                             if pending and not sess.done and pending != sess.last_queued:
-                                log.info("[USER VAD] %s", pending)
+                                log.info("[USER END_SPEECH] %s", pending)
                                 sess.last_queued  = pending
                                 sess.last_interim = ""
-                                record("user_vad", text=pending)
+                                record("user", text=pending)
                                 await utt_q.put(pending)
                         continue
 
@@ -1420,16 +1314,28 @@ async def media_stream(twilio_ws: WebSocket) -> None:
                             _guard_elapsed = time.monotonic() - sess.tts_started_at
                             if sess.state in _TERMINAL:
                                 log.debug("Barge-in suppressed (terminal state): %s", transcript)
+                                continue
                             elif _guard_elapsed < BARGE_IN_GUARD_SEC:
                                 log.debug("Barge-in suppressed (guard %.0f ms): %s", _guard_elapsed * 1000, transcript)
+                                continue
                             else:
+                                # is_final arrived while speaking and guard expired — barge-in
                                 abort[0] = True
-                                log.info("Barge-in utterance: %s", transcript)
-                        log.info("[USER] %s", transcript)
-                        sess.last_queued  = transcript
-                        sess.last_interim = ""
-                        record("user", text=transcript)
-                        await utt_q.put(transcript)
+                                await send_clear()
+                                sess.barge_in_active = True
+                                log.info("Barge-in detected via is_final")
+                        # All paths: update last_interim and (re)start 1.5 s silence timer.
+                        # Timer fires if END_SPEECH never arrives; END_SPEECH cancels it early.
+                        if transcript != sess.last_interim:
+                            sess.last_interim = transcript
+                        _cancel_fallback()
+                        _fallback_task[0] = asyncio.create_task(
+                            _queue_after_silence(transcript)
+                        )
+                        if sess.barge_in_active:
+                            log.info("Barge-in fragment (timer armed): %s", transcript)
+                        else:
+                            log.debug("[USER~final] %s", transcript)
                     else:
                         if transcript != sess.last_interim:
                             log.debug("[USER~] %s", transcript)
@@ -1464,6 +1370,46 @@ async def media_stream(twilio_ws: WebSocket) -> None:
                 sess.state = _AUTO_ADVANCE.get(target, "opening")
                 return False
 
+            async def reroute_intent(utterance: str) -> tuple[bool, bool]:
+                """
+                Called when a data-capture state gets something unexpected.
+                Uses LLM to check if the user changed their mind.
+                Returns (was_handled, should_break_loop).
+                """
+                intent = await classify(utterance, "opening")
+                record("classify", action=intent, context="reroute")
+                if intent == "goto_pay_now":
+                    await go("full_payment_today")
+                    return True, True
+                if intent in ("goto_refusal", "goto_financial_difficulty"):
+                    await go("refusal_ask_reason")
+                    return True, False
+                if intent == "goto_callback":
+                    if _is_callback_time(utterance):
+                        sess.ctx["callback_time"] = await extract_callback_time(utterance)
+                        await go("callback_confirm")
+                        return True, True
+                    await go("callback_ask_time")
+                    return True, False
+                if intent == "goto_future_promise":
+                    d = _parse_date(utterance)
+                    _today = _date.today()
+                    if d and d > _today:
+                        sess.ctx["payment_date"] = _fmt_date(
+                            min(d, _today + timedelta(days=90))
+                        )
+                        await go("future_confirm")
+                        return True, True
+                    await go("future_ask_date")
+                    return True, False
+                if intent == "goto_death":
+                    await go("death_response")
+                    return True, True
+                if intent == "goto_already_paid":
+                    await go("already_paid_ask_date")
+                    return True, False
+                return False, False
+
             while not sess.done:
                 try:
                     utterance = await asyncio.wait_for(utt_q.get(), timeout=SILENCE_TIMEOUT_SEC)
@@ -1478,9 +1424,7 @@ async def media_stream(twilio_ws: WebSocket) -> None:
                 if sess.done:
                     break
 
-                # Wait briefly then drain any follow-up fragments that arrived
-                # while Sarvam STT was still finalising the full sentence.
-                await asyncio.sleep(POST_UTTERANCE_PAUSE_SEC)
+                # Drain any follow-up fragments (e.g. late is_final for same sentence)
                 while not utt_q.empty():
                     try:
                         utterance = utt_q.get_nowait()
@@ -1522,11 +1466,9 @@ async def media_stream(twilio_ws: WebSocket) -> None:
                         await go("already_paid_ask_date")
 
                     elif action == "goto_callback":
-                        # Capture callback time if already mentioned
-                        d = _parse_date(utterance)
-                        _today = _date.today()
-                        if d and d >= _today:
-                            sess.ctx["callback_time"] = _fmt_date(d)
+                        # If user already gave a time, extract it now so we skip callback_ask_time
+                        if _is_callback_time(utterance):
+                            sess.ctx["callback_time"] = await extract_callback_time(utterance)
                             await go("callback_confirm")
                             break
                         await go("callback_ask_time")
@@ -1560,10 +1502,8 @@ async def media_stream(twilio_ws: WebSocket) -> None:
                     if action == "goto_partial_yes":
                         await go("partial_ask_amount")
                     elif action == "goto_callback":
-                        d = _parse_date(utterance)
-                        _today = _date.today()
-                        if d and d >= _today:
-                            sess.ctx["callback_time"] = _fmt_date(d)
+                        if _is_callback_time(utterance):
+                            sess.ctx["callback_time"] = await extract_callback_time(utterance)
                             await go("callback_confirm")
                             break
                         await go("callback_ask_time")
@@ -1575,10 +1515,26 @@ async def media_stream(twilio_ws: WebSocket) -> None:
                 # C2: PARTIAL PAYMENT — capture amount
                 # ══════════════════════════════════════════════════════════════
                 elif sess.state == "partial_ask_amount":
-                    amount = _parse_amount(utterance)
-                    min_p  = int(sess.ctx.get("min_partial_int", "1500"))
+                    # 1. "आधा/half" → half EMI
+                    _t_low = utterance.lower()
+                    if any(k in _t_low for k in ["aadha", "aadhe", "aadhi", "आधा", "आधे", "half"]):
+                        emi_int = int(re.sub(r"[^0-9]", "", sess.ctx.get("emi_amount_int", "8500")))
+                        amount  = emi_int // 2
+                    else:
+                        # 2. Regex extraction
+                        amount = _parse_amount(utterance)
+                        # 3. LLM fallback (catches word-numerals regex misses)
+                        if amount is None:
+                            amount = await llm_extract_amount(utterance)
+
+                    min_p = int(sess.ctx.get("min_partial_int", "1500"))
 
                     if amount is None:
+                        # 4. LLM intent check — user may have changed their mind
+                        handled, should_break = await reroute_intent(utterance)
+                        if handled:
+                            if should_break: break
+                            continue
                         sess.partial_attempts += 1
                         if sess.partial_attempts >= 2:
                             await go("refusal_ask_reason")
@@ -1607,6 +1563,10 @@ async def media_stream(twilio_ws: WebSocket) -> None:
                     today = _date.today()
 
                     if d is None:
+                        handled, should_break = await reroute_intent(utterance)
+                        if handled:
+                            if should_break: break
+                            continue
                         sess.date_retries += 1
                         if sess.date_retries >= 2:
                             # default to 7 days out
@@ -1633,6 +1593,11 @@ async def media_stream(twilio_ws: WebSocket) -> None:
                     today = _date.today()
 
                     if d is None:
+                        # LLM intent check first — user may have pivoted
+                        handled, should_break = await reroute_intent(utterance)
+                        if handled:
+                            if should_break: break
+                            continue
                         sess.date_retries += 1
                         if sess.date_retries >= 2:
                             d = today + timedelta(days=7)
@@ -1682,11 +1647,8 @@ async def media_stream(twilio_ws: WebSocket) -> None:
 
                 # ── C5: credit warning + ask callback time ────────────────────
                 elif sess.state == "refusal_credit_warn":
-                    d = _parse_date(utterance)
-                    if d and d >= _date.today():
-                        sess.ctx["callback_time"] = _fmt_date(d)
-                    elif _is_callback_time(utterance):
-                        sess.ctx["callback_time"] = _clean_callback_time(utterance)
+                    if _is_callback_time(utterance):
+                        sess.ctx["callback_time"] = await extract_callback_time(utterance)
                     else:
                         # Bare ack / silence — default, don't store "हाँ" verbatim
                         sess.ctx["callback_time"] = "जल्द ही"
@@ -1701,6 +1663,11 @@ async def media_stream(twilio_ws: WebSocket) -> None:
                     today = _date.today()
 
                     if d is None:
+                        # LLM intent check — user may have been mistaken or changed mind
+                        handled, should_break = await reroute_intent(utterance)
+                        if handled:
+                            if should_break: break
+                            continue
                         sess.date_retries += 1
                         if sess.date_retries >= 2:
                             sess.ctx["payment_date"] = "recently"
@@ -1735,14 +1702,11 @@ async def media_stream(twilio_ws: WebSocket) -> None:
                 # C7: CALLBACK — capture time
                 # ══════════════════════════════════════════════════════════════
                 elif sess.state == "callback_ask_time":
-                    d = _parse_date(utterance)
                     today = _date.today()
 
-                    if d and d >= today:
-                        sess.ctx["callback_time"] = _fmt_date(d)
-                        sess.date_retries = 0
-                    elif _is_callback_time(utterance):
-                        sess.ctx["callback_time"] = _clean_callback_time(utterance)
+                    if _is_callback_time(utterance):
+                        # LLM extracts a clean speakable phrase — preserves time of day
+                        sess.ctx["callback_time"] = await extract_callback_time(utterance)
                         sess.date_retries = 0
                     else:
                         # No recognisable time — retry once, then default
