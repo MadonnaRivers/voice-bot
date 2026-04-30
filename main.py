@@ -254,19 +254,29 @@ _oai_llm = AsyncOpenAI(api_key=OPENAI_API_KEY)                                # 
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Default customer data — override per-call via POST /make-call body
+# ── Input variables for each outbound call ───────────────────────────────────
+# Pass these fields in the POST /make-call body.  .env fallbacks for testing.
 # ─────────────────────────────────────────────────────────────────────────────
 DEFAULT_CUSTOMER: dict[str, str] = {
-    "customer_name":    os.getenv("DEFAULT_CUSTOMER_NAME",    "Rahul"),
-    "lender":           os.getenv("DEFAULT_LENDER",           "Easy Home Finance"),
-    "loan_type":        os.getenv("DEFAULT_LOAN_TYPE",        "Home Loan"),
-    "loan_id":          os.getenv("DEFAULT_LOAN_ID",          "EH12345"),
-    "emi_amount":       os.getenv("DEFAULT_EMI_AMOUNT",       "8,500"),
-    "emi_amount_int":   os.getenv("DEFAULT_EMI_AMOUNT_INT",   "8500"),
-    "emi_due_date":     os.getenv("DEFAULT_EMI_DUE_DATE",     "5 March 2026"),
-    "min_partial":      os.getenv("DEFAULT_MIN_PARTIAL",      "1,500"),
-    "min_partial_int":  os.getenv("DEFAULT_MIN_PARTIAL_INT",  "1500"),
-    "payment_deadline": os.getenv("DEFAULT_PAYMENT_DEADLINE", ""),  # filled per-call by _build_default_ctx()
+    # ── Core caller inputs (required per call) ────────────────────────────────
+    "customer_name":       os.getenv("DEFAULT_CUSTOMER_NAME",       "Rahul"),
+    "phone_number":        os.getenv("DEFAULT_PHONE_NUMBER",        ""),            # number being dialed
+    "loan_id":             os.getenv("DEFAULT_LOAN_ID",             "EH12345"),
+    "emi_overdue_amt":     os.getenv("DEFAULT_EMI_OVERDUE_AMT",     "8,500"),       # overdue amount (display)
+    "emi_overdue_amt_int": os.getenv("DEFAULT_EMI_OVERDUE_AMT_INT", "8500"),        # integer for arithmetic
+    "emi_overdue_date":    os.getenv("DEFAULT_EMI_OVERDUE_DATE",    "5 March 2026"),# due date of overdue EMI
+
+    # ── Supporting fields ─────────────────────────────────────────────────────
+    "lender":              os.getenv("DEFAULT_LENDER",              "Easy Home Finance"),
+    "loan_type":           os.getenv("DEFAULT_LOAN_TYPE",           "Home Loan"),
+    "min_partial":         os.getenv("DEFAULT_MIN_PARTIAL",         "1,500"),
+    "min_partial_int":     os.getenv("DEFAULT_MIN_PARTIAL_INT",     "1500"),
+    "payment_deadline":    os.getenv("DEFAULT_PAYMENT_DEADLINE",    ""),            # filled by _build_default_ctx()
+
+    # ── Backward-compat aliases so existing scripts keep resolving ────────────
+    "emi_amount":          os.getenv("DEFAULT_EMI_OVERDUE_AMT",     "8,500"),
+    "emi_amount_int":      os.getenv("DEFAULT_EMI_OVERDUE_AMT_INT", "8500"),
+    "emi_due_date":        os.getenv("DEFAULT_EMI_OVERDUE_DATE",    "5 March 2026"),
 }
 
 # Mandatory closing — used at end of C2 C3 C4 C5
@@ -324,6 +334,10 @@ _SCRIPTS: dict[str, str] = {
         "यह तारीख मान्य नहीं लगी। "
         "कृपया एक भविष्य की तारीख बताइए जो नब्बे दिनों के अंदर हो।"
     ),
+    "date_beyond_90": (
+        "हम 90 दिनों से अधिक का समय नहीं दे सकते। "
+        "कृपया अगले 90 दिनों के भीतर एक तारीख बताइए।"
+    ),
     "partial_confirm": (
         "ठीक है, हमने आपकी भुगतान जानकारी नोट कर ली है। "
         + _MANDATORY_CLOSING
@@ -336,6 +350,10 @@ _SCRIPTS: dict[str, str] = {
     "future_date_retry": (
         "यह तारीख मान्य नहीं लगी। "
         "कृपया एक भविष्य की तारीख बताइए जो नब्बे दिनों के अंदर हो।"
+    ),
+    "future_date_beyond_90": (
+        "हम 90 दिनों से अधिक का समय नहीं दे सकते। "
+        "कृपया अगले 90 दिनों के भीतर एक तारीख चुनें, जैसे अगले महीने या दो महीने बाद।"
     ),
     "future_confirm": (
         "ठीक है, हमने आपकी भुगतान तारीख {payment_date} नोट कर ली है। "
@@ -402,6 +420,17 @@ _SCRIPTS: dict[str, str] = {
         "कृपया कोशिश करें कि EMI जल्दी चुका दें ताकि जुर्माना न लगे।"
     ),
 
+    # ── FAQ answers (inline, cross-state) ────────────────────────────────────
+    "faq_emi_amount": (
+        "आपकी EMI {emi_amount} रुपये है, जो {emi_due_date} को देय थी।"
+    ),
+    "faq_due_date": (
+        "आपकी EMI की due date {emi_due_date} थी।"
+    ),
+    "faq_loan_id": (
+        "आपका Loan ID {loan_id} है।"
+    ),
+
     # ── Unclear handler ───────────────────────────────────────────────────────
     "unclear_sm1": (
         "माफी चाहती हूँ, आवाज़ साफ नहीं आई। "
@@ -424,6 +453,9 @@ _TERMINAL: set[str] = {
     "full_payment_today", "refusal_close", "already_paid_confirm",
     "callback_confirm", "unclear_close",
 }
+
+# States where barge-in is suppressed — terminal + opening (opening must play in full)
+_BARGE_IN_LOCKED: set[str] = _TERMINAL | {"opening"}
 
 # States that advance to "opening" after speaking (no user input needed)
 _AUTO_ADVANCE: dict[str, str] = {
@@ -460,13 +492,27 @@ def _parse_date(text: str) -> _date | None:
     t = (t.replace("आज", "aaj")
           .replace("कल", "kal")
           .replace("परसों", "parso").replace("परसो", "parso")
+          .replace("अगले साल", "agle saal").replace("अगले वर्ष", "agle saal")
           .replace("अगले हफ़्ते", "agle hafte")
           .replace("अगले हफ्ते", "agle hafte")
           .replace("इस हफ्ते", "is hafte").replace("इस हफ़्ते", "is hafte")
           .replace("अगले महीने", "agle mahine")
           .replace("महीने में", "mahine mein").replace("महीने बाद", "mahine baad")
           .replace("हफ़्ते में", "hafte mein").replace("हफ्ते में", "hafte mein")
-          .replace("दिनों में", "dinon mein").replace("दिन में", "din mein"))
+          .replace("दिनों में", "dinon mein").replace("दिन में", "din mein")
+          # Hindi month names
+          .replace("जनवरी", "january")
+          .replace("फरवरी", "february").replace("फ़रवरी", "february")
+          .replace("मार्च", "march")
+          .replace("अप्रैल", "april")
+          .replace("मई", "may")
+          .replace("जून", "june")
+          .replace("जुलाई", "july")
+          .replace("अगस्त", "august")
+          .replace("सितंबर", "september").replace("सितम्बर", "september")
+          .replace("अक्टूबर", "october").replace("अक्तूबर", "october")
+          .replace("नवंबर", "november").replace("नवम्बर", "november")
+          .replace("दिसंबर", "december").replace("दिसम्बर", "december"))
 
     if re.search(r"\baaj\b|today", t):
         return today
@@ -474,6 +520,8 @@ def _parse_date(text: str) -> _date | None:
         return today + timedelta(days=1)
     if re.search(r"\bparso\b|parson\b", t):
         return today + timedelta(days=2)
+    if re.search(r"agle\s+saal|next\s+year", t):
+        return today + timedelta(days=366)  # caller will cap to 90
     if re.search(r"agle\s+hafte|next\s+week", t):
         return today + timedelta(days=7)
     if re.search(r"agle\s+mahine|next\s+month|mahine\s+(?:mein|baad)", t):
@@ -575,6 +623,13 @@ def _build_default_ctx() -> dict[str, str]:
     ctx = dict(DEFAULT_CUSTOMER)
     if not ctx.get("payment_deadline"):
         ctx["payment_deadline"] = _fmt_date(_date.today() + timedelta(days=7))
+    # Keep backward-compat aliases in sync with primary input fields
+    if ctx.get("emi_overdue_amt"):
+        ctx.setdefault("emi_amount",     ctx["emi_overdue_amt"])
+    if ctx.get("emi_overdue_amt_int"):
+        ctx.setdefault("emi_amount_int", ctx["emi_overdue_amt_int"])
+    if ctx.get("emi_overdue_date"):
+        ctx.setdefault("emi_due_date",   ctx["emi_overdue_date"])
     return ctx
 
 
@@ -780,6 +835,113 @@ async def extract_callback_time(utterance: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# FAQ detection
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Quick keyword gate — only call LLM when these words appear, saves latency
+_FAQ_TRIGGER_RE = re.compile(
+    r"kitni|kitna|कितनी|कितना|कितने|"
+    r"due\s*date|emi\s*kab|kab\s*deni|"
+    r"loan\s*id|account\s*number|loan\s*number|"
+    r"EMI\s*hai|emi\s*amount|emi\s*kitni",
+    re.IGNORECASE | re.UNICODE,
+)
+
+
+async def check_faq(utterance: str) -> str | None:
+    """Returns FAQ script key (faq_emi_amount / faq_due_date / faq_loan_id) or None."""
+    try:
+        resp = await _oai_llm.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[{"role": "user", "content": (
+                "Is this Hindi/Hinglish utterance asking a factual question about their loan?\n"
+                "EMI_AMOUNT — asking about EMI amount (कितनी EMI है, emi kitni hai)\n"
+                "DUE_DATE   — asking about due date (due date kya hai, kab deni thi)\n"
+                "LOAN_ID    — asking about loan ID or account number\n"
+                "NONE       — not a factual FAQ question\n\n"
+                f"Utterance: {utterance}\nAnswer:"
+            )}],
+            temperature=0,
+            max_tokens=15,
+        )
+        raw = (resp.choices[0].message.content or "").strip().upper()
+        if "EMI_AMOUNT" in raw:
+            return "faq_emi_amount"
+        if "DUE_DATE" in raw:
+            return "faq_due_date"
+        if "LOAN_ID" in raw:
+            return "faq_loan_id"
+        return None
+    except Exception as exc:
+        log.warning("check_faq error: %s", exc)
+        return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Call variable finalisation
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def finalize_call_variables(final_state: str, ctx: dict[str, str]) -> dict:
+    """
+    LLM normalises all captured call variables into structured data.
+    Returns a dict with any of: pay_later_date, cannot_pay_reason,
+    target_date, call_back_time, already_paid_date, summary.
+    """
+    today_str = _date.today().isoformat()
+    raw: dict[str, str] = {}
+
+    if final_state in ("future_confirm", "partial_confirm"):
+        if ctx.get("payment_date"):
+            raw["pay_later_date"] = ctx["payment_date"]
+    if final_state == "already_paid_confirm":
+        if ctx.get("payment_date"):
+            raw["already_paid_date"] = ctx["payment_date"]
+    if ctx.get("callback_time"):
+        raw["call_back_time"] = ctx["callback_time"]
+        raw["target_date"]    = ctx["callback_time"]
+    if ctx.get("refusal_reason"):
+        raw["cannot_pay_reason"] = ctx["refusal_reason"]
+
+    customer = ctx.get("customer_name", "customer")
+    phone    = ctx.get("phone_number", "")
+    loan_id  = ctx.get("loan_id", "")
+    emi      = ctx.get("emi_overdue_amt") or ctx.get("emi_amount", "")
+    emi_date = ctx.get("emi_overdue_date") or ctx.get("emi_due_date", "")
+
+    try:
+        prompt = (
+            f"EMI collection call ended. Today: {today_str}\n"
+            f"Customer: {customer}, Phone: {phone}, Loan ID: {loan_id}\n"
+            f"Overdue EMI: ₹{emi} (due {emi_date}), Final state: {final_state}\n"
+            f"Captured data (raw): {json.dumps(raw, ensure_ascii=False)}\n\n"
+            "Output a JSON object with ONLY the applicable fields:\n"
+            "- pay_later_date: ISO date YYYY-MM-DD when customer will pay\n"
+            "- cannot_pay_reason: 5-10 word English phrase\n"
+            "- target_date: ISO date YYYY-MM-DD (derive from callback time phrase)\n"
+            "- call_back_time: clean callback phrase as-is\n"
+            "- already_paid_date: ISO date YYYY-MM-DD\n"
+            "- summary: one-line English outcome summary\n"
+            "Output ONLY valid JSON, no extra text."
+        )
+        resp = await _oai_llm.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+            max_tokens=200,
+        )
+        raw_out = (resp.choices[0].message.content or "").strip()
+        m = re.search(r'\{.*?\}', raw_out, re.DOTALL)
+        if m:
+            result = json.loads(m.group())
+            log.info("CALL_VARS %s", result)
+            return result
+    except Exception as exc:
+        log.warning("finalize_call_variables error: %s", exc)
+
+    return raw
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # TTS — Sarvam Bulbul v3
 # ─────────────────────────────────────────────────────────────────────────────
 def _tts_payload(text: str) -> dict:
@@ -907,11 +1069,12 @@ class CallSession:
     last_interim:     str  = ""
     transcript_path:  str  = ""
     # workflow state
-    partial_attempts: int  = 0   # retries in partial_ask_amount
-    date_retries:     int  = 0   # retries in date-capture states
-    refusal_attempts: int  = 0   # escalation counter in refusal flow
-    partial_offered:  bool = False  # ensure partial offered only once
-    barge_in_active:  bool = False  # True while collecting post-barge-in utterance
+    partial_attempts:   int  = 0   # retries in partial_ask_amount
+    date_retries:       int  = 0   # retries in date-capture states
+    refusal_attempts:   int  = 0   # escalation counter in refusal flow
+    partial_offered:    bool = False  # ensure partial offered only once
+    barge_in_active:    bool = False  # True while collecting post-barge-in utterance
+    beyond_90_warned:   bool = False  # True after first "beyond 90 days" warning
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -943,6 +1106,15 @@ async def make_call(
     if not to:
         raise HTTPException(status_code=422, detail="`to` (phone number) is required")
     ctx  = {**_build_default_ctx(), **{k: str(v) for k, v in body.items() if k != "to"}}
+    # Capture the dialed number into ctx so it's available in call summary
+    ctx.setdefault("phone_number", to)
+    # Keep aliases in sync if caller sent the new field names
+    if ctx.get("emi_overdue_amt"):
+        ctx["emi_amount"]     = ctx["emi_overdue_amt"]
+    if ctx.get("emi_overdue_amt_int"):
+        ctx["emi_amount_int"] = ctx["emi_overdue_amt_int"]
+    if ctx.get("emi_overdue_date"):
+        ctx["emi_due_date"]   = ctx["emi_overdue_date"]
     call = await asyncio.to_thread(
         lambda: TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN).calls.create(
             url=f"{NGROK_URL}/outgoing-call", to=to, from_=TWILIO_PHONE_NUMBER,
@@ -1142,6 +1314,13 @@ async def media_stream(twilio_ws: WebSocket) -> None:
                     await asyncio.wait_for(drained.wait(), timeout=7.0)
                 except asyncio.TimeoutError:
                     log.warning("Hangup: audio drain timeout")
+            # Normalise and persist call outcome variables
+            try:
+                call_vars = await finalize_call_variables(reason, sess.ctx)
+                if call_vars:
+                    record("call_summary", **call_vars)
+            except Exception as exc:
+                log.warning("call vars error: %s", exc)
             await asyncio.sleep(HANGUP_GRACE_SEC)
             if sess.call_sid:
                 try:
@@ -1265,8 +1444,8 @@ async def media_stream(twilio_ws: WebSocket) -> None:
                         signal = str(inner.get("signal_type", "")).upper()
                         if signal == "START_SPEECH" and sess.speaking:
                             _guard_elapsed = time.monotonic() - sess.tts_started_at
-                            if sess.state in _TERMINAL:
-                                log.debug("Barge-in suppressed (terminal state)")
+                            if sess.state in _BARGE_IN_LOCKED:
+                                log.debug("Barge-in suppressed (locked state: %s)", sess.state)
                             elif _guard_elapsed < BARGE_IN_GUARD_SEC:
                                 log.debug("Barge-in suppressed (guard %.0f ms)", _guard_elapsed * 1000)
                             else:
@@ -1312,8 +1491,8 @@ async def media_stream(twilio_ws: WebSocket) -> None:
                             continue
                         if sess.speaking:
                             _guard_elapsed = time.monotonic() - sess.tts_started_at
-                            if sess.state in _TERMINAL:
-                                log.debug("Barge-in suppressed (terminal state): %s", transcript)
+                            if sess.state in _BARGE_IN_LOCKED:
+                                log.debug("Barge-in suppressed (locked state %s): %s", sess.state, transcript)
                                 continue
                             elif _guard_elapsed < BARGE_IN_GUARD_SEC:
                                 log.debug("Barge-in suppressed (guard %.0f ms): %s", _guard_elapsed * 1000, transcript)
@@ -1434,6 +1613,23 @@ async def media_stream(twilio_ws: WebSocket) -> None:
                 utterance = utterance.strip() or "[silence]"
                 record("user_turn", text=utterance)
                 log.debug("FSM state=%s utterance=%r", sess.state, utterance)
+
+                # ── FAQ check (cross-state) ───────────────────────────────────
+                # If user asks a factual question (EMI amount, due date, loan ID)
+                # answer inline and re-prompt the current question, then loop.
+                if utterance != "[silence]" and _FAQ_TRIGGER_RE.search(utterance):
+                    faq_key = await check_faq(utterance)
+                    if faq_key and faq_key in _SCRIPTS:
+                        record("faq", key=faq_key)
+                        log.info("FAQ detected: %s", faq_key)
+                        faq_text = _SCRIPTS[faq_key]
+                        # For states other than opening, combine answer + re-prompt
+                        if sess.state not in ("opening",) and sess.state in _SCRIPTS:
+                            combined = faq_text + " " + _SCRIPTS[sess.state]
+                            await speak(combined)
+                        else:
+                            await speak(faq_text)
+                        continue
 
                 # ══════════════════════════════════════════════════════════════
                 # ROOT: OPENING
@@ -1569,7 +1765,6 @@ async def media_stream(twilio_ws: WebSocket) -> None:
                             continue
                         sess.date_retries += 1
                         if sess.date_retries >= 2:
-                            # default to 7 days out
                             d = today + timedelta(days=7)
                         else:
                             await speak_state("partial_date_retry")
@@ -1578,10 +1773,16 @@ async def media_stream(twilio_ws: WebSocket) -> None:
                     if d < today:
                         d = today + timedelta(days=7)
                     if d > today + timedelta(days=90):
+                        if not sess.beyond_90_warned:
+                            sess.beyond_90_warned = True
+                            await speak_state("date_beyond_90")
+                            continue
+                        # Second time — cap silently and accept
                         d = today + timedelta(days=90)
 
                     sess.ctx["payment_date"] = _fmt_date(d)
                     sess.date_retries = 0
+                    sess.beyond_90_warned = False
                     await go("partial_confirm")
                     break
 
@@ -1608,10 +1809,16 @@ async def media_stream(twilio_ws: WebSocket) -> None:
                     if d < today:
                         d = today
                     if d > today + timedelta(days=90):
+                        if not sess.beyond_90_warned:
+                            sess.beyond_90_warned = True
+                            await speak_state("future_date_beyond_90")
+                            continue
+                        # Second time — cap silently and accept
                         d = today + timedelta(days=90)
 
                     sess.ctx["payment_date"] = _fmt_date(d)
                     sess.date_retries = 0
+                    sess.beyond_90_warned = False
                     await go("future_confirm")
                     break
 
