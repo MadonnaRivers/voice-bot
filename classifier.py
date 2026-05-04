@@ -2,7 +2,7 @@
 classifier.py — LLM-based intent classification, entity extraction,
                 FAQ detection, and call-variable finalisation.
 
-All calls use OpenAI GPT-4.1-mini via clients.oai_llm.
+All calls use OpenAI gpt-4o-mini via clients.oai_llm.
 """
 from __future__ import annotations
 import json
@@ -161,7 +161,7 @@ _AMBIGUOUS_PREFIXES: frozenset[str] = frozenset(
 
 async def classify(utterance: str, state: str) -> str:
     """
-    GPT-4.1-mini intent classifier with streaming early-exit.
+    gpt-4o-mini intent classifier with streaming early-exit.
 
     Returns as soon as the label token is identified in the stream,
     typically after 1-3 tokens (~80-120 ms) instead of waiting for the

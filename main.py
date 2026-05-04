@@ -17,6 +17,8 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
     datefmt="%H:%M:%S",
 )
+# Suppress noisy httpx request logs (TTS/LLM HTTP calls clutter the output)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("aditi")
 
 # Import app + config after logging is set up

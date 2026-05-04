@@ -38,5 +38,7 @@ class CallSession:
     _hangup_started: bool = False
 
     # Audio capture buffers (PCM16, 8000 Hz, mono)
-    _customer_audio: List[bytes] = dataclasses.field(default_factory=list)
-    _bot_audio:      List[bytes] = dataclasses.field(default_factory=list)
+    _customer_audio:        List[bytes] = dataclasses.field(default_factory=list)
+    _bot_audio:             List[bytes] = dataclasses.field(default_factory=list)
+    # Byte offset into customer audio where bot first started speaking (for stereo alignment)
+    _bot_audio_offset_bytes: int = 0

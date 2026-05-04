@@ -11,6 +11,11 @@ from fastapi.responses import HTMLResponse, JSONResponse
 import carrier
 from clients import http as _http_client
 from config import NGROK_URL, MAKE_CALL_API_KEY
+from urllib.parse import urlparse as _urlparse
+
+# Pre-parse the ngrok hostname once at import time
+# request.url.hostname returns "localhost" when behind ngrok — use NGROK_URL instead
+_WS_HOST = _urlparse(NGROK_URL).netloc   # e.g. "a4d3-xxxx.ngrok-free.app"
 from scripts import build_default_ctx
 from session import pending_ctx
 from call_handler import media_stream
@@ -74,10 +79,26 @@ async def make_call(
 
 @app.api_route("/outgoing-call", methods=["GET", "POST"])
 async def outgoing_call(request: Request) -> HTMLResponse:
-    ws_url = f"wss://{request.url.hostname}/media-stream"
+    # Plivo sends CallUUID in the POST body when the call is answered.
+    # make_call() stored pending_ctx under request_uuid (different from CallUUID),
+    # so we rekey it here so call_handler.py can find the context via sess.call_sid.
+    try:
+        form = await request.form()
+        call_uuid = form.get("CallUUID", "")
+        if call_uuid and pending_ctx:
+            for rid in list(pending_ctx.keys()):
+                if rid != call_uuid:
+                    pending_ctx[call_uuid] = pending_ctx.pop(rid)
+                    log.info("pending_ctx rekeyed: %s → %s", rid, call_uuid)
+                    break
+    except Exception as exc:
+        log.debug("outgoing-call rekey skipped: %s", exc)
+
+    ws_url = f"wss://{_WS_HOST}/media-stream"
+    log.info("connect_response ws_url=%s", ws_url)
     return HTMLResponse(carrier.connect_response(ws_url), media_type="application/xml")
 
 
 @app.websocket("/media-stream")
-async def media_stream_route(twilio_ws: WebSocket) -> None:
-    await media_stream(twilio_ws)
+async def media_stream_route(ws: WebSocket) -> None:
+    await media_stream(ws)
