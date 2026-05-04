@@ -74,7 +74,7 @@ async def tts_stream(
             wav_started = False
             got_audio = False
 
-            async for chunk in resp.aiter_bytes(8192):
+            async for chunk in resp.aiter_bytes(1024):  # 1 KB → ~128 ms at 8 kHz; first audio delivered sooner
                 if abort[0]:
                     return True
                 if not chunk:

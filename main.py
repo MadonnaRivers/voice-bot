@@ -21,19 +21,18 @@ log = logging.getLogger("aditi")
 
 # Import app + config after logging is set up
 from routes import app
-from config import NGROK_URL, TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER, PORT
+from config import NGROK_URL, PORT
 from scripts import build_default_ctx
 from session import pending_ctx
 
 
 def _place_call(to: str, ctx: dict) -> str:
-    from twilio.rest import Client as TwilioClient
-    call = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN).calls.create(
-        url=f"{NGROK_URL}/outgoing-call", to=to, from_=TWILIO_PHONE_NUMBER,
-    )
-    pending_ctx[call.sid] = ctx
-    log.info("Call SID: %s", call.sid)
-    return call.sid
+    import asyncio
+    import carrier as _carrier
+    call_sid = asyncio.run(_carrier.make_call(to, f"{NGROK_URL}/outgoing-call"))
+    pending_ctx[call_sid] = ctx
+    log.info("Call SID: %s", call_sid)
+    return call_sid
 
 
 if __name__ == "__main__":

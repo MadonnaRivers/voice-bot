@@ -34,6 +34,9 @@ class CallSession:
     barge_in_active:   bool = False # True while collecting post-barge-in utterance
     beyond_90_warned:  bool = False # True after first "beyond 90 days" warning
 
+    # Hangup guard — set synchronously before first await to prevent double-hangup
+    _hangup_started: bool = False
+
     # Audio capture buffers (PCM16, 8000 Hz, mono)
     _customer_audio: List[bytes] = dataclasses.field(default_factory=list)
     _bot_audio:      List[bytes] = dataclasses.field(default_factory=list)

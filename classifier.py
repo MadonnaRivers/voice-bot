@@ -60,6 +60,11 @@ CRITICAL DISAMBIGUATION RULES (apply in order):
 5. "अभी time नहीं" / "abhi nahi kar paunga" → GOTO_CALLBACK (temporal busy, not broke)
 6. Bare "नहीं" / "nahi" without aggression → GOTO_FINANCIAL_DIFFICULTY
 7. GOTO_REFUSAL ONLY for explicit aggression, legal threats, or "nahi dunga" with finality
+8. WON'T vs CAN'T — critical distinction:
+   "nahi karunga" / "nahi dunga" / "nahi kar raha" / "nahi karunga main"
+   (active CHOICE not to pay, present/future tense) → GOTO_REFUSAL
+   "nahi kar paunga" / "nahi kar sakta" / "capable nahi" / "mushkil hai"
+   (INABILITY / capacity issue) → GOTO_FINANCIAL_DIFFICULTY
 
 Output ONLY the label, nothing else.""",
 
@@ -69,11 +74,19 @@ Customer said: "{utterance}"
 
 Output EXACTLY ONE label:
 GOTO_PARTIAL_YES — customer agrees to make a partial payment today
-                   ("haan", "thoda de sakta hoon", "2000 abhi", "aadha kar deta hoon", "okay")
-GOTO_CALLBACK    — customer is busy right now and wants to be called back later
-                   ("baad mein", "bahar hoon", "kal baat karte hain", "phir baat karte hain")
-GOTO_PARTIAL_NO  — customer declines partial payment for any other reason
-                   ("nahi", "sambhav nahi", "nahi kar sakta", "partial bhi nahi hoga")
+                   ("haan", "thoda de sakta hoon", "2000 abhi", "aadha kar deta hoon", "okay",
+                    "kar deta hoon", "theek hai", "haan kar dunga")
+GOTO_CALLBACK    — customer is EXPLICITLY busy/unavailable RIGHT NOW and wants to be called back
+                   ("baad mein", "bahar hoon", "kal baat karte hain", "phir baat karte hain",
+                    "abhi time nahi", "meeting mein hoon", "driving kar raha hoon")
+                   NOTE: GOTO_CALLBACK requires a clear temporal unavailability signal.
+GOTO_PARTIAL_NO  — customer declines partial payment or gives any other response including
+                   bare greetings, confusion, silence, or unrelated speech
+                   ("nahi", "sambhav nahi", "nahi kar sakta", "partial bhi nahi hoga",
+                    "hello", "हेलो", "kya", "haan?" ← confusion/greeting without payment intent)
+
+CRITICAL: Bare greetings ("hello", "हेलो", "haan?") with no payment intent → GOTO_PARTIAL_NO, NOT GOTO_CALLBACK.
+GOTO_CALLBACK ONLY if the customer explicitly says they are busy/unavailable right now.
 
 Output ONLY the label, nothing else.""",
 
@@ -136,28 +149,66 @@ _LLM_KEYWORD_MAP: dict[str, str] = {
     "MARK_UNCLEAR":              "mark_unclear",
 }
 
+# Keywords that are strict prefixes of longer keywords in the map.
+# The streaming early-exit must NOT return on these — it must wait for the
+# disambiguating suffix tokens before deciding.
+# e.g. "GOTO_PARTIAL" arrives before "_YES" / "_NO" and must not match early.
+_AMBIGUOUS_PREFIXES: frozenset[str] = frozenset(
+    kw for kw in _LLM_KEYWORD_MAP
+    if any(other != kw and other.startswith(kw) for other in _LLM_KEYWORD_MAP)
+)  # → frozenset({'GOTO_PARTIAL'})
+
 
 async def classify(utterance: str, state: str) -> str:
-    """GPT-4.1-mini intent classifier. Returns a label from _LLM_KEYWORD_MAP."""
+    """
+    GPT-4.1-mini intent classifier with streaming early-exit.
+
+    Returns as soon as the label token is identified in the stream,
+    typically after 1-3 tokens (~80-120 ms) instead of waiting for the
+    full response (~250 ms).  Saves ~100-150 ms per classify call.
+    """
     prompt_template = _LLM_CLASSIFY_PROMPTS.get(state)
     if not prompt_template:
         log.info("CLASSIFY[no-prompt] %s → mark_unclear", state)
         return "mark_unclear"
 
+    content = prompt_template.format(utterance=utterance)
+    _kws_by_len = sorted(_LLM_KEYWORD_MAP, key=len, reverse=True)  # longest-first to avoid prefix match
+
     try:
-        resp = await oai_llm.chat.completions.create(
+        accumulated = ""
+        # stream=True: compatible with all openai SDK v1.x versions
+        stream = await oai_llm.chat.completions.create(
             model=LLM_MODEL,
-            messages=[{"role": "user", "content": prompt_template.format(utterance=utterance)}],
+            messages=[{"role": "user", "content": content}],
             temperature=0,
             max_tokens=32,
+            stream=True,
         )
-        raw = (resp.choices[0].message.content or "").strip().upper()
-        log.info("CLASSIFY[llm] raw=%r", raw[:100])
-        for kw in sorted(_LLM_KEYWORD_MAP, key=len, reverse=True):
-            if kw in raw:
+        async for chunk in stream:
+            delta = chunk.choices[0].delta.content if chunk.choices else None
+            if delta:
+                accumulated += delta
+                upper = accumulated.upper()
+                for kw in _kws_by_len:
+                    if kw in upper:
+                        if kw in _AMBIGUOUS_PREFIXES:
+                            # e.g. "GOTO_PARTIAL" matched before "_YES"/"_NO" arrived —
+                            # keep accumulating until the full label is present.
+                            break
+                        result = _LLM_KEYWORD_MAP[kw]
+                        log.info("CLASSIFY[stream-early] %s → %s (%d chars)",
+                                 state, result, len(accumulated))
+                        return result
+
+        # Stream ended without early match — scan full accumulated text
+        upper = accumulated.upper()
+        for kw in _kws_by_len:
+            if kw in upper:
                 result = _LLM_KEYWORD_MAP[kw]
-                log.info("CLASSIFY[llm] %s → %s", state, result)
+                log.info("CLASSIFY[stream-full] %s → %s", state, result)
                 return result
+
     except Exception as exc:
         log.error("LLM classify error: %s", exc)
 
@@ -301,12 +352,20 @@ async def finalize_call_variables(final_state: str, ctx: dict[str, str]) -> dict
             f"Customer: {customer}, Phone: {phone}, Loan ID: {loan_id}\n"
             f"Overdue EMI: ₹{emi} (due {emi_date}), Final state: {final_state}\n"
             f"Captured data (raw): {json.dumps(raw, ensure_ascii=False)}\n\n"
-            "Output a JSON object with ONLY the applicable fields:\n"
-            "- pay_later_date: ISO date YYYY-MM-DD when customer will pay\n"
-            "- cannot_pay_reason: 5-10 word English phrase\n"
-            "- target_date: ISO date YYYY-MM-DD (derive from callback time phrase)\n"
-            "- call_back_time: clean callback phrase as-is\n"
-            "- already_paid_date: ISO date YYYY-MM-DD\n"
+            "Output a JSON object with ONLY the fields that apply to this final_state:\n"
+            "  full_payment_today   → summary only. NEVER set already_paid_date here.\n"
+            "  future_confirm       → pay_later_date (ISO), summary\n"
+            "  partial_confirm      → pay_later_date (ISO), summary\n"
+            "  already_paid_confirm → already_paid_date (ISO, from raw data), summary\n"
+            "  callback_confirm     → call_back_time, target_date (ISO), summary\n"
+            "  refusal_close        → cannot_pay_reason (5-10 word English), call_back_time, target_date (ISO), summary\n"
+            "  death_response / no_response / unclear_close / stt_failure → summary only\n"
+            "Field definitions:\n"
+            "- pay_later_date: ISO date YYYY-MM-DD when customer promised to pay\n"
+            "- cannot_pay_reason: 5-10 word English phrase explaining inability to pay\n"
+            "- target_date: ISO date YYYY-MM-DD derived from the callback time phrase\n"
+            "- call_back_time: callback time phrase exactly as captured\n"
+            "- already_paid_date: ISO date YYYY-MM-DD of the claimed prior payment\n"
             "- summary: one-line English outcome summary\n"
             "Output ONLY valid JSON, no extra text."
         )

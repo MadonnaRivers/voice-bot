@@ -2,24 +2,30 @@
 routes.py — FastAPI application and HTTP/WebSocket route definitions.
 """
 from __future__ import annotations
-import asyncio
 import logging
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Header, HTTPException, Request, WebSocket
 from fastapi.responses import HTMLResponse, JSONResponse
-from twilio.rest import Client as TwilioClient
 
-from config import (
-    TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER,
-    NGROK_URL, MAKE_CALL_API_KEY,
-)
+import carrier
+from clients import http as _http_client
+from config import NGROK_URL, MAKE_CALL_API_KEY
 from scripts import build_default_ctx
 from session import pending_ctx
 from call_handler import media_stream
 
 log = logging.getLogger("aditi")
 
-app = FastAPI(title="Aditi — Hindi EMI Collection Voice Bot")
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    yield                          # server is running
+    await _http_client.aclose()   # clean up httpx on shutdown → no "Event loop is closed" warning
+    log.info("HTTP client closed")
+
+
+app = FastAPI(title="Aditi — Hindi EMI Collection Voice Bot", lifespan=_lifespan)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -60,25 +66,16 @@ async def make_call(
     if ctx.get("emi_overdue_date"):
         ctx["emi_due_date"]   = ctx["emi_overdue_date"]
 
-    call = await asyncio.to_thread(
-        lambda: TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN).calls.create(
-            url=f"{NGROK_URL}/outgoing-call", to=to, from_=TWILIO_PHONE_NUMBER,
-        )
-    )
-    pending_ctx[call.sid] = ctx
-    log.info("Outbound call initiated — SID=%s to=%s", call.sid, to)
-    return JSONResponse({"call_sid": call.sid})
+    call_sid = await carrier.make_call(to, f"{NGROK_URL}/outgoing-call")
+    pending_ctx[call_sid] = ctx
+    log.info("Outbound call initiated — SID=%s to=%s", call_sid, to)
+    return JSONResponse({"call_sid": call_sid})
 
 
 @app.api_route("/outgoing-call", methods=["GET", "POST"])
 async def outgoing_call(request: Request) -> HTMLResponse:
-    from twilio.twiml.voice_response import Connect, VoiceResponse
-    resp = VoiceResponse()
-    resp.pause(length=1)
-    conn = Connect()
-    conn.stream(url=f"wss://{request.url.hostname}/media-stream")
-    resp.append(conn)
-    return HTMLResponse(str(resp), media_type="application/xml")
+    ws_url = f"wss://{request.url.hostname}/media-stream"
+    return HTMLResponse(carrier.connect_response(ws_url), media_type="application/xml")
 
 
 @app.websocket("/media-stream")

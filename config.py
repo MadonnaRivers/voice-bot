@@ -16,12 +16,34 @@ def _req(name: str) -> str:
     return v
 
 
+# ── Carrier selection ─────────────────────────────────────────────────────────
+CARRIER = os.getenv("CARRIER", "twilio").lower()   # "twilio" | "exotel"
+
 # ── Required credentials ──────────────────────────────────────────────────────
-SARVAM_API_KEY      = _req("SARVAM_API_KEY")
-TWILIO_ACCOUNT_SID  = _req("TWILIO_ACCOUNT_SID")
-TWILIO_AUTH_TOKEN   = _req("TWILIO_AUTH_TOKEN")
-TWILIO_PHONE_NUMBER = _req("TWILIO_PHONE_NUMBER")
-NGROK_URL           = _req("NGROK_URL").rstrip("/")
+SARVAM_API_KEY = _req("SARVAM_API_KEY")
+NGROK_URL      = _req("NGROK_URL").rstrip("/")
+
+# Twilio — required when CARRIER=twilio
+if CARRIER == "twilio":
+    TWILIO_ACCOUNT_SID  = _req("TWILIO_ACCOUNT_SID")
+    TWILIO_AUTH_TOKEN   = _req("TWILIO_AUTH_TOKEN")
+    TWILIO_PHONE_NUMBER = _req("TWILIO_PHONE_NUMBER")
+else:
+    TWILIO_ACCOUNT_SID  = os.getenv("TWILIO_ACCOUNT_SID",  "")
+    TWILIO_AUTH_TOKEN   = os.getenv("TWILIO_AUTH_TOKEN",   "")
+    TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER", "")
+
+# Exotel — required when CARRIER=exotel
+if CARRIER == "exotel":
+    EXOTEL_API_KEY      = _req("EXOTEL_API_KEY")
+    EXOTEL_API_TOKEN    = _req("EXOTEL_API_TOKEN")
+    EXOTEL_SID          = _req("EXOTEL_SID")
+    EXOTEL_PHONE_NUMBER = _req("EXOTEL_PHONE_NUMBER")
+else:
+    EXOTEL_API_KEY      = os.getenv("EXOTEL_API_KEY",      "")
+    EXOTEL_API_TOKEN    = os.getenv("EXOTEL_API_TOKEN",    "")
+    EXOTEL_SID          = os.getenv("EXOTEL_SID",          "")
+    EXOTEL_PHONE_NUMBER = os.getenv("EXOTEL_PHONE_NUMBER", "")
 
 # ── Sarvam endpoints ──────────────────────────────────────────────────────────
 SARVAM_STT_WS_BASE  = os.getenv("SARVAM_STT_WS_BASE",  "wss://api.sarvam.ai/speech-to-text/ws")
@@ -59,11 +81,14 @@ SILENCE_TIMEOUT_SEC      = float(os.getenv("SILENCE_TIMEOUT_SEC",      "20.0"))
 TTS_PACE                 = float(os.getenv("TTS_PACE",                 "1.1"))
 BARGE_IN_GUARD_SEC       = float(os.getenv("BARGE_IN_GUARD_SEC",       "1.5"))
 # Lower = faster bot response; too low may cut off trailing words
-POST_UTTERANCE_PAUSE_SEC = float(os.getenv("POST_UTTERANCE_PAUSE_SEC", "1.0"))
+# 0.3s is safe because Sarvam END_SPEECH fires first on normal sentences;
+# the timer only triggers when END_SPEECH is delayed or missing.
+POST_UTTERANCE_PAUSE_SEC = float(os.getenv("POST_UTTERANCE_PAUSE_SEC", "0.3"))
 
 # ── VAD (WebRTC noise gate) ───────────────────────────────────────────────────
 VAD_MODE         = int(os.getenv("VAD_MODE",         "2"))
-VAD_HANGOVER_MS  = int(os.getenv("VAD_HANGOVER_MS",  "500"))
+# 200ms = fast END_SPEECH; raise to 350 if trailing syllables get clipped
+VAD_HANGOVER_MS  = int(os.getenv("VAD_HANGOVER_MS",  "200"))
 VAD_ENABLED      = os.getenv("VAD_ENABLED", "true").lower() not in ("0", "false", "no")
 
 # ── Spectral denoiser ─────────────────────────────────────────────────────────

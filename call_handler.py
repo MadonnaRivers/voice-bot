@@ -10,7 +10,6 @@ from __future__ import annotations
 import array
 import asyncio
 import audioop
-import base64
 import concurrent.futures
 import json
 import logging
@@ -27,11 +26,10 @@ import websockets
 import websockets.exceptions as ws_exc
 from fastapi import WebSocket
 from fastapi.websockets import WebSocketDisconnect
-from twilio.rest import Client as TwilioClient
 
+import carrier as _carrier
 from config import (
     SARVAM_API_KEY, SARVAM_STT_WS_URL,
-    TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN,
     VAD_ENABLED, VAD_MODE, VAD_HANGOVER_MS,
     DENOISE_ENABLED, DENOISE_STRENGTH, DENOISE_PROFILE_SEC, DENOISE_STATIONARY,
     HANGUP_GRACE_SEC, SILENCE_TIMEOUT_SEC, BARGE_IN_GUARD_SEC,
@@ -130,6 +128,7 @@ async def media_stream(twilio_ws: WebSocket) -> None:
     utt_q: asyncio.Queue[str] = asyncio.Queue()
     drained = asyncio.Event()
     drained.set()
+    _tts_cache: dict[str, bytes] = {}   # pre-generated audio keyed by FSM state name
 
     _denoiser = (
         StreamDenoiser(
@@ -173,7 +172,7 @@ async def media_stream(twilio_ws: WebSocket) -> None:
             except OSError:
                 pass
 
-        # ── Push µ-law frames to Twilio ──────────────────────────────────────
+        # ── Push µ-law frames to carrier ─────────────────────────────────────
         async def push(chunk: bytes) -> None:
             if sess.done or abort[0] or not sess.stream_sid:
                 return
@@ -184,10 +183,9 @@ async def media_stream(twilio_ws: WebSocket) -> None:
                     frame = chunk[offset:offset + 160]
                     if not frame:
                         return
-                    await twilio_ws.send_json({
-                        "event": "media", "streamSid": sess.stream_sid,
-                        "media": {"payload": base64.b64encode(frame).decode()},
-                    })
+                    await twilio_ws.send_json(
+                        _carrier.media_msg(frame, sess.stream_sid)
+                    )
                     # Capture bot audio (µ-law → PCM16 for WAV)
                     try:
                         sess._bot_audio.append(audioop.ulaw2lin(frame, 2))
@@ -200,25 +198,28 @@ async def media_stream(twilio_ws: WebSocket) -> None:
         async def send_mark() -> None:
             if sess.done or not sess.stream_sid:
                 return
+            msg = _carrier.mark_msg(sess.stream_sid)
+            if msg is None:
+                # Carrier has no mark support — treat audio as immediately drained
+                drained.set()
+                return
             drained.clear()
             sess.marks_out += 1
             try:
-                await twilio_ws.send_json({
-                    "event": "mark", "streamSid": sess.stream_sid,
-                    "mark":  {"name": "tts_done"},
-                })
+                await twilio_ws.send_json(msg)
             except Exception:
                 pass
 
         async def send_clear() -> None:
             if sess.done or not sess.stream_sid:
                 return
+            msg = _carrier.clear_msg(sess.stream_sid)
+            sess.marks_out = 0
+            drained.set()
+            if msg is None:
+                return  # Carrier has no clear support — just reset local state
             try:
-                await twilio_ws.send_json({
-                    "event": "clear", "streamSid": sess.stream_sid,
-                })
-                sess.marks_out = 0
-                drained.set()
+                await twilio_ws.send_json(msg)
             except Exception:
                 pass
 
@@ -279,15 +280,88 @@ async def media_stream(twilio_ws: WebSocket) -> None:
 
         async def speak_state(state: str) -> None:
             script = SCRIPTS.get(state, "")
-            if script:
+            if not script:
+                return
+            cached = _tts_cache.pop(state, None)
+            if cached is not None:
+                # Cache hit — play pre-generated audio, skip TTS round-trip (~400-600 ms saved)
+                text = script.format_map(_SafeMap(sess.ctx))
+                log.info("[ADITI][cached] %.80s", text)
+                record("bot", text=text)
+                abort[0] = False
+                sess.barge_in_active = False
+                sess.tts_started_at  = time.monotonic()
+                sess.speaking = True
+                try:
+                    await push(cached)
+                    if not sess.done:
+                        await send_mark()
+                except Exception as exc:
+                    log.error("cached TTS push error: %s", exc)
+                finally:
+                    sess.speaking = False
+            else:
                 await speak(script)
+
+        # ── TTS pre-cache — runs while opening plays ──────────────────────────
+        # Scripts safe to pre-cache: only use ctx fields that are fixed at call start.
+        # Dynamic fields (payment_date, partial_amount, callback_time) are NOT pre-cached.
+        _PRECACHE_STATES = [
+            # Most-likely first responses (priority order)
+            "full_payment_today", "offer_partial", "callback_ask_time",
+            "future_ask_date", "already_paid_ask_date", "refusal_ask_reason",
+            # Secondary states
+            "refusal_escalate", "refusal_credit_warn", "callback_time_unclear",
+            "partial_ask_amount", "partial_amount_unclear", "partial_amount_too_low",
+            "future_date_retry", "future_date_beyond_90",
+            "date_beyond_90", "partial_date_retry",
+            "already_paid_date_unclear", "already_paid_date_invalid",
+            "unclear_sm1", "unclear_sm2",
+            "beyond_90_penalty_close",
+        ]
+
+        async def _precache_one(state: str) -> None:
+            if sess.done:
+                return
+            script = SCRIPTS.get(state, "")
+            if not script or state in _tts_cache:
+                return
+            try:
+                text = script.format_map(_SafeMap(sess.ctx))
+                buf: list[bytes] = []
+                _stop = [False]
+                async def _col(c: bytes) -> None:
+                    buf.append(c)
+                ok = await tts_stream(text, _col, _stop)
+                if ok and buf and not sess.done:
+                    _tts_cache[state] = b"".join(buf)
+                    log.debug("TTS pre-cached: %s (%d B)", state, len(_tts_cache[state]))
+            except Exception as exc:
+                log.debug("TTS pre-cache %s: %s", state, exc)
+
+        async def _precache_tts_bg() -> None:
+            """
+            Pre-generate TTS for all likely states concurrently while the opening
+            plays (opening takes ~3-5 s — plenty of time to fill the cache).
+            Uses batches of 4 to avoid flooding the HTTP connection pool.
+            """
+            _BATCH = 4
+            for i in range(0, len(_PRECACHE_STATES), _BATCH):
+                if sess.done:
+                    break
+                await asyncio.gather(
+                    *[_precache_one(s) for s in _PRECACHE_STATES[i : i + _BATCH]],
+                    return_exceptions=True,
+                )
+            log.info("TTS pre-cache complete (%d states)", len(_tts_cache))
 
         # ── Hangup ───────────────────────────────────────────────────────────
         async def hangup(reason: str = "unknown") -> None:
-            if sess.done:
+            if sess.done or sess._hangup_started:
                 return
-            # Do NOT set sess.done yet — recv_twilio must keep running to
-            # receive Twilio's mark event so drained can fire.
+            sess._hangup_started = True  # set before first await — prevents double-hangup
+            # Do NOT set sess.done yet — recv_ws must keep running to
+            # receive the carrier's mark event so drained can fire.
             abort[0] = True   # stop any future TTS from sending audio
             log.info("Hangup: %s", reason)
             record("hangup", reason=reason)
@@ -312,19 +386,23 @@ async def media_stream(twilio_ws: WebSocket) -> None:
             await asyncio.sleep(HANGUP_GRACE_SEC)
             if sess.call_sid:
                 try:
-                    _sid = sess.call_sid
-                    await asyncio.to_thread(
-                        lambda: TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-                                .calls(_sid).update(status="completed")
-                    )
-                    log.info("Call %s terminated", sess.call_sid)
+                    await _carrier.hangup(sess.call_sid)
                 except Exception as exc:
-                    log.error("Twilio hangup error: %s", exc)
+                    log.error("Carrier hangup error: %s", exc)
             for ws in (stt_ws, twilio_ws):
                 try:
                     await ws.close()
                 except Exception:
                     pass
+
+        # ── 90-day payment cap (from emi_overdue_date, not today) ────────────
+        def _max_date() -> _date:
+            """Return the 90-day maximum payment date anchored to emi_overdue_date."""
+            raw = sess.ctx.get("emi_overdue_date") or sess.ctx.get("emi_due_date", "")
+            base = parse_date(raw) if raw else None
+            if base is None:
+                base = _date.today()
+            return base + timedelta(days=90)
 
         # ── FSM transition helper ─────────────────────────────────────────────
         async def go(state: str, *, reset_unclear: bool = True) -> None:
@@ -336,19 +414,20 @@ async def media_stream(twilio_ws: WebSocket) -> None:
             if state in TERMINAL:
                 asyncio.create_task(hangup(state))
 
-        # ── Twilio receiver ──────────────────────────────────────────────────
-        async def recv_twilio() -> None:
+        # ── Carrier WebSocket receiver ────────────────────────────────────────
+        async def recv_ws() -> None:
+            import base64 as _b64
             opened = False
             try:
                 async for raw in twilio_ws.iter_text():
                     if sess.done:
                         break
-                    data = json.loads(raw)
-                    evt  = data.get("event")
+                    data     = json.loads(raw)
+                    evt_type, payload = _carrier.parse_ws_frame(data)
 
-                    if evt == "start":
-                        sess.stream_sid = data["start"]["streamSid"]
-                        sess.call_sid   = data["start"].get("callSid", "")
+                    if evt_type == "call_start":
+                        sess.stream_sid = payload["stream_sid"]
+                        sess.call_sid   = payload["call_sid"]
                         if sess.call_sid in pending_ctx:
                             sess.ctx = pending_ctx.pop(sess.call_sid)
                         log.info("Stream=%s Call=%s", sess.stream_sid, sess.call_sid)
@@ -356,13 +435,14 @@ async def media_stream(twilio_ws: WebSocket) -> None:
                         if not opened:
                             opened = True
                             asyncio.create_task(speak_state("opening"))
+                            asyncio.create_task(_precache_tts_bg())  # fill cache while opening plays
 
-                    elif evt == "media":
+                    elif evt_type == "audio_frame":
                         if sess.done:
                             continue
-                        raw_audio = base64.b64decode(data["media"]["payload"])
+                        mulaw = payload["mulaw"]
                         try:
-                            pcm16 = audioop.ulaw2lin(raw_audio, 2)
+                            pcm16 = audioop.ulaw2lin(mulaw, 2)
                             sess._customer_audio.append(pcm16)   # ← capture customer audio
                             if _denoiser is not None:
                                 pcm16 = await _loop.run_in_executor(
@@ -381,7 +461,7 @@ async def media_stream(twilio_ws: WebSocket) -> None:
                                     pcm16 = b"\x00" * 320
                             await stt_ws.send(json.dumps({
                                 "audio": {
-                                    "data":        base64.b64encode(pcm16).decode(),
+                                    "data":        _b64.b64encode(pcm16).decode(),
                                     "sample_rate": 8000,
                                     "encoding":    "audio/wav",
                                 }
@@ -392,15 +472,17 @@ async def media_stream(twilio_ws: WebSocket) -> None:
                             log.error("STT send error: %s", exc)
                             break
 
-                    elif evt == "mark":
+                    elif evt_type == "mark_ack":
                         if sess.marks_out > 0:
                             sess.marks_out -= 1
                         if sess.marks_out <= 0:
                             sess.marks_out = 0
                             drained.set()
 
+                    # evt_type == "ignore" → nothing to do
+
             except WebSocketDisconnect:
-                log.info("Twilio WS disconnected")
+                log.info("Carrier WS disconnected")
             except RuntimeError as exc:
                 if "WebSocket is not connected" not in str(exc):
                     raise
@@ -554,7 +636,7 @@ async def media_stream(twilio_ws: WebSocket) -> None:
                     _today = _date.today()
                     if d and d > _today:
                         sess.ctx["payment_date"] = fmt_date(
-                            min(d, _today + timedelta(days=90))
+                            min(d, _max_date())
                         )
                         await go("future_confirm")
                         return True, True
@@ -623,8 +705,8 @@ async def media_stream(twilio_ws: WebSocket) -> None:
                         d = parse_date(utterance)
                         _today = _date.today()
                         if d and d > _today:
-                            if d > _today + timedelta(days=90):
-                                d = _today + timedelta(days=90)
+                            if d > _max_date():
+                                d = _max_date()
                             sess.ctx["payment_date"] = fmt_date(d)
                             await go("future_confirm")
                             break
@@ -659,7 +741,24 @@ async def media_stream(twilio_ws: WebSocket) -> None:
                     action = await classify(utterance, "offer_partial")
                     record("classify", action=action)
                     if action == "goto_partial_yes":
-                        await go("partial_ask_amount")
+                        # Try to extract the amount from the yes utterance
+                        # e.g. "haan 3000 de sakta hoon" — skip partial_ask_amount if valid
+                        _min_p   = int(sess.ctx.get("min_partial_int", "1500"))
+                        _emi_int = int(re.sub(r"[^0-9]", "", sess.ctx.get("emi_amount_int", "8500")))
+                        _amt = parse_amount(utterance) or await llm_extract_amount(utterance)
+                        if _amt is not None and _amt >= _emi_int:
+                            sess.partial_offered = True
+                            await go("full_payment_today")
+                            break
+                        elif _amt is not None and _amt >= _min_p:
+                            _remaining = max(0, _emi_int - _amt)
+                            sess.ctx["partial_amount"]    = f"{_amt:,}"
+                            sess.ctx["remaining_balance"] = f"{_remaining:,}"
+                            sess.partial_offered = True
+                            await go("partial_ask_remaining_date")
+                        else:
+                            sess.partial_offered = True
+                            await go("partial_ask_amount")
                     elif action == "goto_callback":
                         if is_callback_time(utterance):
                             sess.ctx["callback_time"] = await extract_callback_time(utterance)
@@ -667,22 +766,32 @@ async def media_stream(twilio_ws: WebSocket) -> None:
                             break
                         await go("callback_ask_time")
                     else:
+                        # Check for death or other intent changes before going to refusal
+                        handled, should_break = await reroute_intent(utterance)
+                        if handled:
+                            if should_break: break
+                            continue
                         await go("refusal_ask_reason")
 
                 # ══════════════════════════════════════════════════════════════
                 # C2: PARTIAL PAYMENT — capture amount
                 # ══════════════════════════════════════════════════════════════
                 elif sess.state == "partial_ask_amount":
+                    min_p   = int(sess.ctx.get("min_partial_int", "1500"))
+                    emi_int = int(re.sub(r"[^0-9]", "", sess.ctx.get("emi_amount_int", "8500")))
+
                     _t_low = utterance.lower()
                     if any(k in _t_low for k in ["aadha", "aadhe", "aadhi", "आधा", "आधे", "half"]):
-                        emi_int = int(re.sub(r"[^0-9]", "", sess.ctx.get("emi_amount_int", "8500")))
-                        amount  = emi_int // 2
+                        amount = emi_int // 2
                     else:
                         amount = parse_amount(utterance)
                         if amount is None:
                             amount = await llm_extract_amount(utterance)
 
-                    min_p = int(sess.ctx.get("min_partial_int", "1500"))
+                    # If customer offers full EMI or more → treat as full payment
+                    if amount is not None and amount >= emi_int:
+                        await go("full_payment_today")
+                        break
 
                     if amount is None:
                         handled, should_break = await reroute_intent(utterance)
@@ -704,7 +813,6 @@ async def media_stream(twilio_ws: WebSocket) -> None:
                             await speak_state("partial_amount_too_low")
                         continue
 
-                    emi_int = int(re.sub(r"[^0-9]", "", sess.ctx.get("emi_amount_int", "8500")))
                     remaining = max(0, emi_int - amount)
                     sess.ctx["partial_amount"]    = f"{amount:,}"
                     sess.ctx["remaining_balance"] = f"{remaining:,}"
@@ -728,12 +836,14 @@ async def media_stream(twilio_ws: WebSocket) -> None:
                             continue
                     if d < today:
                         d = today + timedelta(days=7)
-                    if d > today + timedelta(days=90):
+                    if d > _max_date():
                         if not sess.beyond_90_warned:
                             sess.beyond_90_warned = True
                             await speak_state("date_beyond_90")
                             continue
-                        d = today + timedelta(days=90)
+                        # Second attempt still beyond 90 days → penalty close
+                        await go("beyond_90_penalty_close")
+                        break
                     sess.ctx["payment_date"] = fmt_date(d)
                     sess.date_retries = 0
                     sess.beyond_90_warned = False
@@ -759,12 +869,14 @@ async def media_stream(twilio_ws: WebSocket) -> None:
                             continue
                     if d < today:
                         d = today
-                    if d > today + timedelta(days=90):
+                    if d > _max_date():
                         if not sess.beyond_90_warned:
                             sess.beyond_90_warned = True
                             await speak_state("future_date_beyond_90")
                             continue
-                        d = today + timedelta(days=90)
+                        # Second attempt still beyond 90 days → penalty close
+                        await go("beyond_90_penalty_close")
+                        break
                     sess.ctx["payment_date"] = fmt_date(d)
                     sess.date_retries = 0
                     sess.beyond_90_warned = False
@@ -797,6 +909,14 @@ async def media_stream(twilio_ws: WebSocket) -> None:
                     await go("refusal_credit_warn")
 
                 elif sess.state == "refusal_credit_warn":
+                    # Do NOT use reroute_intent here — the bot asked "when should we call
+                    # you back?" so ANY response (even "never", "next year", "don't call")
+                    # is a callback-time answer, not a new payment intent.
+                    # Only death is checked separately since it's a special closure.
+                    _rcw_intent = await classify(utterance, "opening")
+                    if _rcw_intent == "goto_death":
+                        await go("death_response")
+                        break
                     if is_callback_time(utterance):
                         sess.ctx["callback_time"] = await extract_callback_time(utterance)
                     else:
@@ -810,6 +930,15 @@ async def media_stream(twilio_ws: WebSocket) -> None:
                 elif sess.state == "already_paid_ask_date":
                     d = parse_date(utterance)
                     today = _date.today()
+                    # "कल किया/करा/कर दिया" → yesterday, not tomorrow
+                    # parse_date maps "कल" to today+1 regardless of context
+                    _PAST_RE = re.compile(
+                        r"kiy[ao]|kar[ao]|kar\s*diy[ao]|ho\s*gay[ao]|kar\s*chuk[ao]"
+                        r"|किया|किये|करा|कर\s*दिया|हो\s*गया|कर\s*चुका",
+                        re.IGNORECASE | re.UNICODE,
+                    )
+                    if d == today + timedelta(days=1) and _PAST_RE.search(utterance):
+                        d = today - timedelta(days=1)  # "kal kiya" = yesterday
                     if d is None:
                         handled, should_break = await reroute_intent(utterance)
                         if handled:
@@ -849,6 +978,11 @@ async def media_stream(twilio_ws: WebSocket) -> None:
                         sess.ctx["callback_time"] = await extract_callback_time(utterance)
                         sess.date_retries = 0
                     else:
+                        # Check for intent change (death, pay now, refusal, etc.)
+                        handled, should_break = await reroute_intent(utterance)
+                        if handled:
+                            if should_break: break
+                            continue
                         sess.date_retries += 1
                         if sess.date_retries >= 2:
                             sess.ctx["callback_time"] = "जल्द ही"
@@ -866,7 +1000,7 @@ async def media_stream(twilio_ws: WebSocket) -> None:
 
             log.info("FSM ended (state=%s)", sess.state)
 
-        await asyncio.gather(recv_twilio(), recv_sarvam_stt(), fsm())
+        await asyncio.gather(recv_ws(), recv_sarvam_stt(), fsm())
 
     finally:
         _denoise_pool.shutdown(wait=False)

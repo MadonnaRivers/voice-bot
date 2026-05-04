@@ -35,10 +35,12 @@ def parse_date(text: str) -> _date | None:
           .replace("कल", "kal")
           .replace("परसों", "parso").replace("परसो", "parso")
           .replace("अगले साल", "agle saal").replace("अगले वर्ष", "agle saal")
+          .replace("अगली साल", "agle saal").replace("अगली वर्ष", "agle saal")  # feminine form
           .replace("अगले हफ़्ते", "agle hafte")
           .replace("अगले हफ्ते", "agle hafte")
+          .replace("अगली हफ्ते", "agle hafte").replace("अगली हफ़्ते", "agle hafte")
           .replace("इस हफ्ते", "is hafte").replace("इस हफ़्ते", "is hafte")
-          .replace("अगले महीने", "agle mahine")
+          .replace("अगले महीने", "agle mahine").replace("अगली महीने", "agle mahine")
           .replace("महीने में", "mahine mein").replace("महीने बाद", "mahine baad")
           .replace("हफ़्ते में", "hafte mein").replace("हफ्ते में", "hafte mein")
           .replace("दिनों में", "dinon mein").replace("दिन में", "din mein")
@@ -80,7 +82,8 @@ def parse_date(text: str) -> _date | None:
 
     # "15 March" / "March 15" (with optional year)
     for name, num in _MONTH_MAP.items():
-        m = re.search(rf"(\d{{1,2}})\s+{name}(?:\s+(\d{{4}}))?", t)
+        # \b after name prevents "mar" matching within "march", "oct" within "october", etc.
+        m = re.search(rf"(\d{{1,2}})\s+{name}\b(?:\s+(\d{{4}}))?", t)
         if m:
             day, year = int(m.group(1)), int(m.group(2)) if m.group(2) else today.year
             try:
@@ -90,7 +93,7 @@ def parse_date(text: str) -> _date | None:
                 return d
             except ValueError:
                 return None
-        m = re.search(rf"{name}\s+(\d{{1,2}})(?:\s+(\d{{4}}))?", t)
+        m = re.search(rf"{name}\b\s+(\d{{1,2}})(?:\s+(\d{{4}}))?", t)
         if m:
             day, year = int(m.group(1)), int(m.group(2)) if m.group(2) else today.year
             try:
@@ -132,13 +135,16 @@ def parse_amount(text: str) -> int | None:
          .replace("सौ", "sau").replace("सो", "sau")
          .replace("लाख", "lakh"))
 
-    m = re.search(r"(\d+)\s*(?:hazaar|hazar|hajar|thousand)\s*(?:(\d+)\s*(?:sau|so|hundred))?", t)
+    # Decimal-aware lakh and hazaar — e.g. "1.5 lakh" → 150000, "2.5 hazaar" → 2500
+    m = re.search(r"(\d+(?:\.\d+)?)\s*lakh", t)
     if m:
-        return int(m.group(1)) * 1000 + (int(m.group(2)) * 100 if m.group(2) else 0)
+        return int(float(m.group(1)) * 100_000)
 
-    m = re.search(r"(\d+)\s*lakh", t)
+    m = re.search(r"(\d+(?:\.\d+)?)\s*(?:hazaar|hazar|hajar|thousand)\s*(?:(\d+)\s*(?:sau|so|hundred))?", t)
     if m:
-        return int(m.group(1)) * 100_000
+        base = int(float(m.group(1)) * 1000)
+        extra = int(m.group(2)) * 100 if m.group(2) else 0
+        return base + extra
 
     m = re.search(r"(\d+)\s*(?:sau|so|hundred)", t)
     if m:
@@ -176,12 +182,12 @@ _BARE_ACK = re.compile(
 
 _TIME_WORD = re.compile(
     r"\d"
-    r"|kal\b|parso\b|agle\b|hafte?\b|mahine?\b|ghante?\b|baje?\b|"
+    r"|kal\b|parso\b|agle\b|agli\b|hafte?\b|mahine?\b|ghante?\b|baje?\b|saal\b|"
     r"shaam\b|raat\b|subah\b|dopahar\b|savere\b|"
     r"monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
     r"somvar|mangal|budhvar|gurvar|shukra|shanivar|ravivar|"
-    r"week|month|morning|evening|night|afternoon|hour|minute|"
-    r"कल|परसों|अगले|हफ्ते?|महीने?|घंटे?|बजे?|"
+    r"week|month|year|morning|evening|night|afternoon|hour|minute|"
+    r"कल|परसों|अगले|अगली|हफ्ते?|महीने?|घंटे?|बजे?|साल|वर्ष|"
     r"शाम|रात|सुबह|दोपहर|सवेरे|"
     r"सोमवार|मंगलवार|बुधवार|गुरुवार|शुक्रवार|शनिवार|रविवार|"
     r"दिन\b|सप्ताह|तारीख",
