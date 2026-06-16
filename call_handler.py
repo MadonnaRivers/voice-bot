@@ -13,7 +13,6 @@ import audioop
 import concurrent.futures
 import json
 import logging
-import random
 import time
 from pathlib import Path
 from datetime import datetime, timezone
@@ -45,13 +44,9 @@ log = logging.getLogger("aditi")
 
 _VAD_HANGOVER_FRAMES = max(1, VAD_HANGOVER_MS // 20)
 
-# Short "thinking" fillers — played after each customer reply to cover
+# Short "thinking" filler — played after each customer reply to cover
 # LLM + TTS latency so the customer hears acknowledgement instead of dead air.
-_THINKING_FILLERS: tuple[str, ...] = (
-    "uhhh, ek second dijiyega",
-    "note kar liya, ek second dijiyega",
-    "hmmm, ek second dena",
-)
+_THINKING_FILLER = "ek second please"
 
 # Keys the LLM must never write into session context.
 _FORBIDDEN_CTX_KEYS: frozenset[str] = frozenset({
@@ -841,7 +836,7 @@ async def media_stream(ws: WebSocket) -> None:
                 if await _stream_apply_turn(
                     utterance,
                     utterance,
-                    preroll=random.choice(_THINKING_FILLERS),
+                    preroll=_THINKING_FILLER,
                 ):
                     break
 
